@@ -32,8 +32,8 @@ Notes from [HF model card](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
 - Weights: 1.58-bit with 8-bit activations (W1.58A8)
 - Model: Based off of LLaMa
     - Modified with BitLinear layers
-    - Uses Rotary Position Embeddings [(RoPE)](https://arxiv.org/abs/2104.09864).
-    - Uses squared ReLU [(ReLU²)](https://paperswithcode.com/method/squared-relu) activation in FFN layers
+    - Uses Rotary Position Embeddings [(RoPE)](https://arxiv.org/abs/2104.09864)
+    - Uses squared ReLU (ReLU²)] activation in FFN layers
     - Employs [Sub-LayerNorm](https://proceedings.mlr.press/v202/wang23u.html) normalization
     - No bias terms in linear or normalization layers
       - Binarization is a form of regularization. By reducing precision, the model generalizes better
