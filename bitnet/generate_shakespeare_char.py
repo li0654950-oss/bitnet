@@ -55,6 +55,9 @@ def main():
     p.add_argument("--block_size", type=int, default=256, help="must match training")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--ternary", action="store_true",
+                   help="use 2-bit packed ternary weights + Triton kernel")
+    p.add_argument("--ternary_path", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
     args = p.parse_args()
 
     device = args.device or (
@@ -80,11 +83,27 @@ def main():
         ffn_dim=1664,
     ).to(device, dtype=torch.bfloat16)
 
-    sd = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(sd)  # strict=True: errors if block_size mismatches training
+    if args.ternary:
+        # 2-bit ternary inference: load packed weights, switch BitLinear to ternary kernel
+        from model import BitLinear
+        data = torch.load(args.ternary_path, map_location=device, weights_only=True)
+        base_sd = {k: v for k, v in data.items() if not isinstance(v, dict)}
+        model.load_state_dict(base_sd, strict=False)  # embed_tokens, norms, buffers
+        n_ternary = 0
+        for name, module in model.named_modules():
+            if isinstance(module, BitLinear):
+                key = name + ".weight"
+                if key in data and isinstance(data[key], dict):
+                    module.set_inference(data[key]["packed"].to(device), data[key]["scale"])
+                    n_ternary += 1
+        ckpt_info = f"ternary 2-bit ({n_ternary} BitLinear kernels) from {args.ternary_path}"
+    else:
+        sd = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(sd)  # strict=True: errors if block_size mismatches training
+        ckpt_info = args.checkpoint
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[loaded {args.checkpoint} | {n_params/1e6:.2f}M params | {device} | "
+    print(f"[loaded {ckpt_info} | {n_params/1e6:.2f}M params | {device} | "
           f"T={args.temperature} top_k={args.top_k}]", file=sys.stderr)
 
     # initial context: encoded prompt, or BOS (token 0) for char-level

@@ -35,7 +35,15 @@ class BitLinear(nn.Module):
     self.weight = nn.Parameter(torch.empty((out_features, in_features)))
     self.norm = nn.RMSNorm(in_features)
     nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-      
+    # inference-only: 2-bit packed ternary weight + per-tensor scale (not in state_dict)
+    self.register_buffer("_ternary_packed", None, persistent=False)
+    self._scale_w = None  # python float (scalar), set by set_inference
+
+  def set_inference(self, packed, scale_w):
+    """Switch to pure ternary inference: 2-bit packed weight + scale."""
+    self._ternary_packed = packed
+    self._scale_w = float(scale_w)
+
   def forward(self, x):
     """
     Args: x: an input tensor with shape [n, d]
@@ -44,6 +52,12 @@ class BitLinear(nn.Module):
     # NOTE: the paper says not to use normalization, but then contradicts it by using RMSNorm in their code. dont use for now?
     # x_quant = x
     x_norm = self.norm(x)
+    if self._ternary_packed is not None:
+      # pure ternary inference: per-token int8 activation + 2-bit packed ternary kernel
+      from ternary_kernel import ternary_linear
+      scale_x = 127.0 / x_norm.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+      x_int8 = (x_norm * scale_x).round().clamp(-128, 127).to(torch.int8)
+      return ternary_linear(x_int8, self._ternary_packed, scale_x, self._scale_w).to(x.dtype)
     x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach() # A trick for implementing Straight−Through−Estimator (STE) using detach()
     w_quant = self.weight + (weight_quant(self.weight) - self.weight).detach()
     y = F.linear(x_quant, w_quant)
