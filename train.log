@@ -1,0 +1,71 @@
+nohup: ignoring input
+device: cuda
+vocab_size: 65
+model params: 15,041,280 (15.04M)  dtype: bfloat16
+step     0 | train 4.3469 | val 4.3513 | lr 2.00e-03 | 9.7s
+  ★ new best val 4.3513 @ step 0 -> saved checkpoints/bitnet_shakespeare_char_best.pt
+--- sample ---
+decoding…
+?qf;xbDkRZk
+wc.wj,ZT,OLlT,ebtK
+b:qPWCkMBbUA$3:.aSvgO-33SM:F?gLTa
+--- end sample ---
+step   250 | train 1.4741 | val 1.6794 | lr 1.88e-03 | 69.7s
+  ★ new best val 1.6794 @ step 250 -> saved checkpoints/bitnet_shakespeare_char_best.pt
+--- sample ---
+decoding…
+
+My Lord him us crown. Warwith home, away, my face,
+are zonn he 
+--- end sample ---
+step   500 | train 1.3125 | val 1.5752 | lr 1.76e-03 | 129.5s
+  ★ new best val 1.5752 @ step 500 -> saved checkpoints/bitnet_shakespeare_char_best.pt
+--- sample ---
+decoding…
+
+ROMEO:
+This has! All help in act in every cintle is tide,
+Stand
+--- end sample ---
+step   750 | train 1.2197 | val 1.5591 | lr 1.64e-03 | 188.7s
+  ★ new best val 1.5591 @ step 750 -> saved checkpoints/bitnet_shakespeare_char_best.pt
+--- sample ---
+decoding…
+How in the world about like to be the sea on him.
+
+Second Citize
+--- end sample ---
+step  1000 | train 1.1448 | val 1.5653 | lr 1.52e-03 | 248.7s
+--- sample ---
+decoding…
+
+young Bolingbroke's living death would thank on,--
+A while I br
+--- end sample ---
+step  1250 | train 1.0780 | val 1.5955 | lr 1.40e-03 | 314.3s
+--- sample ---
+decoding…
+To you, sirrah, and himself,--On what's the king?
+
+Nurse:
+I am t
+--- end sample ---
+step  1500 | train 1.0025 | val 1.6725 | lr 1.28e-03 | 379.4s
+--- sample ---
+decoding…
+QUEEN MARGARET:
+And how, signior King Edward but have done,
+And 
+--- end sample ---
+step  1750 | train 0.9348 | val 1.7456 | lr 1.16e-03 | 444.8s
+--- sample ---
+decoding…
+LADY GREY:
+For haive me assua: your honour can call it.
+
+GLOUCES
+--- end sample ---
+step  2000 | train 0.8616 | val 1.8245 | lr 1.04e-03 | 509.3s
+early stopping @ step 2000: no val improvement for 5 evals (best 1.5591 @ step 750)
+saved final: checkpoints/bitnet_shakespeare_char_5000.pt
+best val 1.5591 @ step 750 -> checkpoints/bitnet_shakespeare_char_best.pt (early stopped)

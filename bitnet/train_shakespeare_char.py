@@ -9,9 +9,15 @@ STE-ternarized to {-1, 0, +1} inside BitLinear — no model.py changes.
 Model:  d_model=512, n_layer=6, n_head=8, n_kv_head=4, ffn_dim=1664, block=256
         -> 15,041,280 params (15.04M), bfloat16
 
+Checkpoints:
+  checkpoints/bitnet_shakespeare_char_best.pt   <- val-optimal (auto-saved)
+  checkpoints/bitnet_shakespeare_char_<N>.pt    <- final-step weights
+
 Usage:
   python bitnet/train_shakespeare_char.py --smoke          # 20-step sanity check
   python bitnet/train_shakespeare_char.py                  # full 5000-step run
+  python bitnet/train_shakespeare_char.py --patience 5     # early stop (default)
+  python bitnet/train_shakespeare_char.py --patience 0      # disable early stop
 """
 import os
 import sys
@@ -40,6 +46,10 @@ def main():
     p.add_argument("--eval_iters", type=int, default=200)
     p.add_argument("--sample_tokens", type=int, default=256)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--patience", type=int, default=5,
+                   help="early stop after N evals w/o val improvement (0=off)")
+    p.add_argument("--min_delta", type=float, default=0.0,
+                   help="min val decrease to count as an improvement")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -105,8 +115,12 @@ def main():
         return out
 
     os.makedirs("checkpoints", exist_ok=True)
+    best_path = "checkpoints/bitnet_shakespeare_char_best.pt"
     t0 = time.time()
     best_val = float("inf")
+    best_step = 0
+    bad_counter = 0
+    stopped_early = False
 
     for it in range(max_iters):
         if it % eval_interval == 0 or it == max_iters - 1:
@@ -116,8 +130,25 @@ def main():
                 f"| lr {optimizer.param_groups[0]['lr']:.2e} | {time.time()-t0:.1f}s",
                 flush=True,
             )
-            if losses["val"] < best_val:
+
+            # best-checkpoint saving + early stopping
+            if losses["val"] < best_val - args.min_delta:
                 best_val = losses["val"]
+                best_step = it
+                bad_counter = 0
+                if not args.smoke:
+                    torch.save(model.state_dict(), best_path)
+                    print(f"  ★ new best val {best_val:.4f} @ step {it} -> saved {best_path}")
+            else:
+                bad_counter += 1
+                if (not args.smoke) and args.patience > 0 and bad_counter >= args.patience:
+                    print(
+                        f"early stopping @ step {it}: no val improvement for "
+                        f"{args.patience} evals (best {best_val:.4f} @ step {best_step})"
+                    )
+                    stopped_early = True
+                    break
+
             if not args.smoke:
                 model.eval()
                 with torch.no_grad():
@@ -139,9 +170,11 @@ def main():
                 pg["weight_decay"] = 0.0
 
     if not args.smoke:
-        path = f"checkpoints/bitnet_shakespeare_char_{max_iters}.pt"
-        torch.save(model.state_dict(), path)
-        print(f"saved: {path}  (best val {best_val:.4f})")
+        final_path = f"checkpoints/bitnet_shakespeare_char_{max_iters}.pt"
+        torch.save(model.state_dict(), final_path)
+        tag = " (early stopped)" if stopped_early else ""
+        print(f"saved final: {final_path}")
+        print(f"best val {best_val:.4f} @ step {best_step} -> {best_path}{tag}")
     else:
         print(f"smoke done. final loss {loss:.4f}, best val {best_val:.4f}")
 
