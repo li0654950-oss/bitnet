@@ -7,3 +7,4 @@ bitnet-b1.58-2B-4T
 wandb/
 data/model.safetensors
 checkpoints/
+.claude/
