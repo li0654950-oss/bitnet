@@ -82,8 +82,8 @@ if HAS_TRITON:
             w_ptrs = w_ptr + rn[:, None] * K4 + kp[None, :]
             wb = tl.load(w_ptrs, mask=(rn[:, None] < N) & (kp[None, :] < K4), other=0)
             shift = (k % 4) * 2                     # [BK]
-            code = ((wb.to(tl.int32) >> shift[None, :]) & 0x3)   # [BN, BK] in {0,1,2}
-            ternary = (code - 1).to(tl.bfloat16)    # [BN, BK] in {-1,0,1}
+            code = ((wb.to(tl.int32) >> shift[None, :]) & 0x3)   # [BN, BK] in {0,1,3} (2-bit two's complement)
+            ternary = tl.where(code >= 2, code - 4, code).to(tl.bfloat16)  # 3->-1, 0->0, 1->1
 
             # acc += x @ ternary.T   -> [BM, BN]
             acc += tl.dot(x, tl.trans(ternary))
@@ -129,9 +129,8 @@ if __name__ == "__main__":
     # random ternary weight + packed, random int8 activation
     for (N, K) in [(512, 512), (65, 512), (1664, 512), (512, 1664), (256, 512)]:
         ternary = torch.randint(-1, 2, (N, K), dtype=torch.int8)  # {-1,0,1}
-        code = (ternary + 1).to(torch.uint8)
         from export_ternary import pack_2bit
-        packed = pack_2bit(code)                       # [N, K//4]
+        packed = pack_2bit(ternary)                     # [N, K//4] (two's complement)
         scale_w = 1.0 / 0.05
 
         M = 7

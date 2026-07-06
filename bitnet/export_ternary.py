@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Export a trained BitNet checkpoint to 2-bit packed ternary weights.
+Export BitNet weights as 2-bit packed ternary {-1, 0, +1} (two's complement encoding).
 
-For every BitLinear weight (those with a sibling `<prefix>.norm.weight`):
-  bf16 weight  --weight_quant-->  ternary {-1,0,+1} + per-tensor scale
-  ternary  --encode (code=ternary+1 in {0,1,2})-->  2-bit
-  2-bit     --pack 4-per-byte-->  uint8 [out, in//4]
+Encoding (2-bit two's complement, code values are semantically {-1,0,1}):
+  -1 -> 0b11 (3),  0 -> 0b00 (0),  +1 -> 0b01 (1)   [0b10 (2) unused]
+Packed 4 codes/byte (uint8). Storage identical to {0,1,2} offset encoding,
+but the code is the literal two's-complement representation of {-1,0,1}.
 
-Non-BitLinear tensors (embed_tokens, RMSNorm/SubLN gamma, inv_freq,
-causal_mask) are stored as-is.
+For every BitLinear weight: bf16 -> weight_quant -> ternary {-1,0,1} -> 2bit packed + scale_w.
 
 Output: checkpoints/bitnet_shakespeare_char_ternary.pt
   { name: {"packed": uint8[out,in//4], "scale": float, "shape": (out,in)},  # BitLinear
@@ -35,32 +34,30 @@ def weight_quant(w: torch.Tensor):
     return ternary, scale
 
 
-def pack_2bit(code: torch.Tensor) -> torch.Tensor:
-    """code: [..., K] uint8 in {0,1,2}, K%4==0 -> uint8 [..., K//4].
+def pack_2bit(ternary: torch.Tensor) -> torch.Tensor:
+    """ternary: [..., K] int8 {-1,0,1}, K%4==0 -> uint8 [..., K//4].
 
-    Packs 4 consecutive codes into one byte: code[4i] | code[4i+1]<<2 | ...
+    2-bit two's complement: -1 -> 0b11 (3), 0 -> 0b00 (0), +1 -> 0b01 (1).
     """
-    assert code.dtype == torch.uint8
-    K = code.shape[-1]
-    assert K % 4 == 0, f"K={K} must be divisible by 4 for 2-bit packing"
+    assert ternary.dtype == torch.int8
+    K = ternary.shape[-1]
+    assert K % 4 == 0, f"K={K} must be divisible by 4"
+    code = (ternary.to(torch.int32) & 0x3).to(torch.uint8)  # -1->3, 0->0, 1->1
     c0, c1, c2, c3 = code[..., 0::4], code[..., 1::4], code[..., 2::4], code[..., 3::4]
-    packed = (c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)).to(torch.uint8)
-    return packed
+    return (c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)).to(torch.uint8)
 
 
 def unpack_2bit(packed: torch.Tensor) -> torch.Tensor:
-    """uint8 [..., K//4] -> int8 [..., K] in {-1, 0, 1}."""
+    """uint8 [..., K//4] -> int8 [..., K] {-1,0,1} (two's complement decode)."""
     p = packed.to(torch.int32)
-    c0 = p & 0x3
-    c1 = (p >> 2) & 0x3
-    c2 = (p >> 4) & 0x3
-    c3 = (p >> 6) & 0x3
+    c0, c1, c2, c3 = p & 0x3, (p >> 2) & 0x3, (p >> 4) & 0x3, (p >> 6) & 0x3
     code = torch.stack([c0, c1, c2, c3], dim=-1).reshape(*packed.shape[:-1], -1)
-    return (code - 1).to(torch.int8)  # {0,1,2} -> {-1,0,1}
+    # 2-bit two's complement: 3 -> -1, 0 -> 0, 1 -> 1 (2 unused)
+    return torch.where(code >= 2, code - 4, code).to(torch.int8)
 
 
 def is_bitlinear_weight(name: str, keys: set) -> bool:
-    """A BitLinear weight has a sibling `<prefix>.norm.weight` (BitLinear holds an RMSNorm)."""
+    """A BitLinear weight has a sibling `<prefix>.norm.weight`."""
     if not name.endswith(".weight"):
         return False
     prefix = name[: -len(".weight")]
@@ -78,30 +75,30 @@ def main():
     keys = set(sd.keys())
     exported = {}
     n_packed = 0
-    n_bytes_packed = 0
+    n_bytes = 0
 
     for name, t in sd.items():
         if is_bitlinear_weight(name, keys):
             w = t.to(torch.float32)
             ternary, scale = weight_quant(w)            # {-1,0,1} fp32, scale fp32
-            code = (ternary + 1).to(torch.uint8)         # {0,1,2}
-            packed = pack_2bit(code)                     # uint8 [out, in//4]
+            ternary_int8 = ternary.to(torch.int8)        # {-1,0,1} int8
+            packed = pack_2bit(ternary_int8)             # 2-bit two's complement
             exported[name] = {
                 "packed": packed.cpu(),
                 "scale": float(scale),
                 "shape": tuple(w.shape),
             }
             n_packed += 1
-            n_bytes_packed += packed.numel()
+            n_bytes += packed.numel()
         else:
             exported[name] = t.cpu()
     torch.save(exported, args.out)
 
-    bf16_bytes = sum(t.numel() * 2 for n, t in sd.items() if t.dtype == torch.bfloat16)
-    print(f"packed {n_packed} BitLinear weights -> {n_bytes_packed:,} bytes "
-          f"({n_bytes_packed/1e6:.2f} MB)")
-    print(f"original bf16 weights: {bf16_bytes:,} bytes ({bf16_bytes/1e6:.2f} MB)")
-    print(f"compression: {bf16_bytes/max(n_bytes_packed,1):.1f}x")
+    bf16_bytes = sum(t.numel() * 2 for _, t in sd.items() if t.dtype == torch.bfloat16)
+    print(f"packed {n_packed} BitLinear weights -> {n_bytes:,} bytes "
+          f"({n_bytes/1e6:.2f} MB, 2-bit two's complement {-1,0,1})")
+    print(f"original bf16: {bf16_bytes:,} bytes ({bf16_bytes/1e6:.2f} MB)  "
+          f"compression: {bf16_bytes/max(n_bytes,1):.1f}x")
     print(f"saved: {args.out}")
 
     if not args.no_verify:
@@ -109,23 +106,24 @@ def main():
 
 
 def verify(exported, sd):
-    """Reconstruct weights from packed and confirm they match weight_quant exactly."""
+    """Confirm unpacked ternary matches weight_quant exactly."""
     keys = set(sd.keys())
     max_diff = 0.0
     for name, t in sd.items():
         if not is_bitlinear_weight(name, keys):
             continue
         w = t.to(torch.float32)
-        ternary_ref, scale_ref = weight_quant(w)  # reference
+        ternary_ref, scale_ref = weight_quant(w)
         e = exported[name]
         ternary_rec = unpack_2bit(e["packed"]).to(torch.float32)  # {-1,0,1}
-        # reconstructed w_quant = ternary / scale
         diff = (ternary_rec - ternary_ref).abs().max().item()
         max_diff = max(max_diff, diff)
         assert abs(e["scale"] - float(scale_ref)) < 1e-8, f"{name}: scale mismatch"
-    print(f"verify: max |ternary_reconstructed - ternary_ref| = {max_diff} "
-          f"({'OK' if max_diff == 0 else 'MISMATCH'})")
-    assert max_diff == 0, "ternary reconstruction does not match weight_quant"
+        assert set(unpack_2bit(e["packed"]).unique().tolist()).issubset({-1, 0, 1}), \
+            f"{name}: non-ternary values found"
+    print(f"verify: max |ternary_rec - ternary_ref| = {max_diff} "
+          f"({'OK' if max_diff == 0 else 'MISMATCH'}), values ⊆ {{-1,0,1}} ✓")
+    assert max_diff == 0
 
 
 if __name__ == "__main__":
