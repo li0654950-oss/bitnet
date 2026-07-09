@@ -100,7 +100,7 @@ class RotaryMHA(nn.Module):
     v = v.repeat_interleave(self.n_head // self.n_kv, dim=2)
 
     # ── RoPE ──────────────────────────────────────────────
-    seq = torch.arange(T, device=x.device)
+    seq = torch.arange(T, device=x.device).to(torch.float32)
     freqs = torch.einsum("t , d -> t d", seq, self.inv_freq)     # T × (d/2)
     cos, sin = freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
 
