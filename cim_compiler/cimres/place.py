@@ -65,11 +65,15 @@ def place(cimres_in, out_path):
                     inner.attributes["a_page"] = i32_attr(A_PAGE_BASE + kb)
                     inner.attributes["psum_page"] = i32_attr(PSUM_PAGE_BASE + nb)
                     n_matmul += 1
+        if max_dest >= 4096:
+            raise ValueError(
+                f"[C2] max dest_id={max_dest} >= Macro 上限 4096 (§4.5)。"
+                f"tile 总数 {max_dest + 1} 超 Macro 数, 降低模型规模或启用 Macro 复用")
         mod.operation.verify()
         with open(out_path, "w") as f:
             f.write(str(mod))
         print(f"[C2] {n_preload} preload + {n_matmul} matmul 物理绑定, "
-              f"max dest_id={max_dest} (< 4096: {'OK' if max_dest < 4096 else 'OVER'})",
+              f"max dest_id={max_dest} (< 4096: OK)",
               file=sys.stderr)
         print(f"[C2] A_PAGE=0x{A_PAGE_BASE:x}+k_blk, PSUM_PAGE=0x{PSUM_PAGE_BASE:x}+n_blk, "
               f"b_page=(dest%{PRELOAD_BATCH})*4", file=sys.stderr)

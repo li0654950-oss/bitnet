@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""系统级仿真文本生成: 文本 prompt -> JIT 仿真自回归 -> 输出文本。
+
+复用 generate.py 的 CIM 仿真链路 (cim_jit + hw_simulator --sim), 但:
+  - prompt 为文本 (CharTokenizer encode 成 token 序列作初始 context)
+  - 输出 decode 成文本
+  - 同时跑 PyTorch reference (greedy) 对比
+
+用法:
+  conda run -n nanogpt-gpu python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --n 60
+"""
+import os
+import sys
+import argparse
+import importlib.util
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+_EXPORT_DIR = os.path.join(REPO, "cim_compiler", "export")
+if _EXPORT_DIR not in sys.path:
+    sys.path.insert(0, _EXPORT_DIR)
+_E2E_PATH = "/home/li/workspace/torch-mlir/projects/pt1/python"
+if _E2E_PATH not in sys.path:
+    sys.path.insert(0, _E2E_PATH)
+
+import numpy as np
+import torch
+
+
+def _load_cim_jit():
+    spec = importlib.util.spec_from_file_location("cim_jit", os.path.join(HERE, "cim_jit.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def generate(invoker, model, idx0, n, block_size, ref=False):
+    """greedy 自回归生成 n token, 返回 token 列表 (含 prompt)。"""
+    idx = idx0.clone()
+    tokens = idx[0].tolist()
+    for i in range(n):
+        if idx.shape[1] >= block_size:
+            idx = idx[:, -block_size:]
+        if ref:
+            with torch.no_grad():
+                logits = model(idx)[0]
+        else:
+            inputs = _build_inputs(model, idx)
+            logits = np.asarray(invoker.invoke("main", *inputs))
+        nxt = int(np.argmax(logits[0, -1])) if not ref else int(logits[0, -1].argmax())
+        tokens.append(nxt)
+        idx = torch.cat([idx, torch.tensor([[nxt]], dtype=torch.long)], dim=1)
+        if (i + 1) % 10 == 0:
+            print(f"  ...已生成 {i+1}/{n} token", file=sys.stderr)
+    return tokens
+
+
+def _build_inputs(model, idx):
+    import cim_jit as _cj
+    return _cj.build_inputs(model, idx)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--in", dest="inp", default="checkpoints/bitnet_ternary_placeholder.mlir")
+    p.add_argument("--ternary", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
+    p.add_argument("--so", default=os.path.join(HERE, "cim_stub.so"))
+    p.add_argument("--prompt", default="ROMEO:", help="起始文本 (须为 vocab 内字符)")
+    p.add_argument("--num-tokens", dest="n", type=int, default=60, help="生成 token 数")
+    p.add_argument("--block_size", type=int, default=256)
+    p.add_argument("--sim", action="store_true", default=True, help="用 hw_simulator MMIO 仿真")
+    p.add_argument("--no-ref", action="store_true", help="跳过 PyTorch reference")
+    args = p.parse_args()
+
+    # ---- tokenizer ----
+    from bitnet.data_char import CharTokenizer
+    tok = CharTokenizer()
+    vocab = tok.itos
+    bad = [c for c in args.prompt if c not in tok.stoi]
+    if bad:
+        print(f"[err] prompt 含 vocab 外字符: {bad}", file=sys.stderr)
+        print(f"      vocab={sorted(vocab.values())}", file=sys.stderr)
+        sys.exit(1)
+    prompt_ids = tok.encode(args.prompt)
+    if not prompt_ids:
+        prompt_ids = [0]  # BOS
+    idx0 = torch.tensor([prompt_ids], dtype=torch.long)
+    print(f"[prompt] {args.prompt!r} -> {len(prompt_ids)} token: {prompt_ids}", file=sys.stderr)
+
+    # ---- 构建 JIT + 仿真器 ----
+    cim_jit = _load_cim_jit()
+    sys.modules["cim_jit"] = cim_jit
+    print("[run] 构建 LLVM mod (in-memory L2+L3+L4)...", file=sys.stderr)
+    mod = cim_jit.build_llvm_mod(args.inp)
+    invoker = cim_jit.CIMInvoker(mod, args.so)
+    print("[run] ExecutionEngine + cim_stub.so 就绪", file=sys.stderr)
+
+    if args.sim:
+        from cim_compiler.cimres.hw_simulator import HwCimSimulator
+        sim = HwCimSimulator()
+        sim_lib = cim_jit.register_cim_hw_sim(args.so, sim)
+        fwd = os.path.join(REPO, "cim_compiler/cimres/checkpoints/forward.bin")
+        pre = os.path.join(REPO, "cim_compiler/cimres/checkpoints/preload.bin")
+        sim_lib.cim_load_forward(fwd.encode())
+        sim_lib.cim_preload_init(pre.encode())
+        print(f"[run] CIM 仿真器就绪 (MMIO + cycle 时序, {len(sim.macros.macro)} Macro 预载)",
+              file=sys.stderr)
+
+    from inference_model import build_inference_model
+    model = build_inference_model(args.ternary, vocab_size=65)
+
+    # ---- JIT 仿真生成 ----
+    print(f"[run] JIT 仿真自回归生成 {args.n} token...", file=sys.stderr)
+    jit_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=False)
+
+    # ---- PyTorch reference ----
+    ref_tokens = None
+    if not args.no_ref:
+        print("[run] PyTorch reference 生成...", file=sys.stderr)
+        ref_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=True)
+
+    # ---- 输出文本 ----
+    jit_text = tok.decode(jit_tokens)
+    print("\n" + "=" * 60, file=sys.stderr)
+    print(f"prompt  : {args.prompt!r}")
+    print(f"JIT 仿真输出 ({len(jit_tokens)} token):")
+    print(jit_text)
+    if ref_tokens is not None:
+        ref_text = tok.decode(ref_tokens)
+        match = jit_tokens == ref_tokens
+        print("-" * 60)
+        print(f"PyTorch ref 输出:")
+        print(ref_text)
+        print("-" * 60)
+        print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
+    print("=" * 60, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

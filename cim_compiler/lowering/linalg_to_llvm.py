@@ -69,7 +69,7 @@ def cim_call_to_memref(mod):
         if str(op.name) == "func.call":
             ca = op.attributes.get("callee")
             callee = ca.value if hasattr(ca, "value") else str(ca).strip('"')
-            if callee.startswith("cim_launch_"):
+            if callee == "cim_launch":
                 calls.append(op)
         return ir.WalkResult.ADVANCE
 
@@ -94,8 +94,12 @@ def cim_call_to_memref(mod):
             oat = [str(o.type) for o in call.operands]
             ort = [str(r.type) for r in call.results]
             with ir.InsertionPoint(call):
-                ba = [buf_d.ToBufferOp(ir.Type.parse(at.replace("tensor", "memref"), ctx), o, loc=loc).results[0]
-                      for o, at in zip(call.operands, oat)]
+                ba = []
+                for o, at in zip(call.operands, oat):
+                    if "tensor" in at:
+                        ba.append(buf_d.ToBufferOp(ir.Type.parse(at.replace("tensor", "memref"), ctx), o, loc=loc).results[0])
+                    else:
+                        ba.append(o)  # [A1] i64 idx 等标量直接传, 不 to_buffer
                 mrt = [ir.Type.parse(rt.replace("tensor", "memref"), ctx) for rt in ort]
                 nc = func_d.CallOp(mrt, callee, ba, loc=loc)
                 tr = [buf_d.ToTensorOp(ir.Type.parse(rt, ctx), mr, restrict=True, loc=loc).results[0]

@@ -73,6 +73,7 @@ def emit(placed_path, weights_path, preload_out, forward_out):
 
     # 按 func.func 顺序遍历 (idx = func 序号 = cim_launch_<idx> IDX)
     forward_segs = []   # idx -> [48-bit MATMUL 字 (+SYNC_HALT)]
+    seg_names = []      # [P1-5] idx -> BitLinear 名 (容量校验报错用)
     preload_list = []   # [(dest_id, b_page_start)]
     dest_meta = {}      # dest_id -> (name, nb, kb)
     for op in list(mod.body):
@@ -82,6 +83,7 @@ def emit(placed_path, weights_path, preload_out, forward_out):
             preload_list.append((d, b))
         elif op.operation.name == "func.func":
             seg = []
+            seg_name = "?"
             blk = op.regions[0].blocks[0]
             for inner in list(blk.operations):
                 if inner.operation.name != "cimres.macro_matmul":
@@ -93,11 +95,29 @@ def emit(placed_path, weights_path, preload_out, forward_out):
                 name = str(inner.attributes["bitlinear_name"].value)
                 nb = int(inner.attributes["n_blk"].value)
                 kb = int(inner.attributes["k_blk"].value)
+                if seg_name == "?":
+                    seg_name = name   # [P1-5] 段对应 BitLinear 名
                 seg.append(encode(OP_MATMUL, dest_id=d, page1=a, page2=p, accum=acc))
                 dest_meta[d] = (name, nb, kb)
             seg.append(encode(OP_SYNC_HALT))
             forward_segs.append(seg)
+            seg_names.append(seg_name)
     preload_list.sort(key=lambda x: x[0])   # 按 dest_id 排序, 批内连续
+
+    # [P1-5] 容量校验 (硬件约束, 友好报错)
+    MACRO_MAX = 4096          # §4.5 Macro 总数上限
+    SEG_MAX = PRELOAD_BATCH   # 681, 指令区 4KB/6B=682 条, 留 1 SYNC_HALT
+    n_tile = len(preload_list)
+    if n_tile > MACRO_MAX:
+        raise ValueError(
+            f"[C3] tile 总数 {n_tile} > Macro 上限 {MACRO_MAX} (§4.5)。"
+            f"降低模型规模 (n_layer/d_model/ffn) 或启用 Macro 复用")
+    for i, seg in enumerate(forward_segs):
+        n_mm = len(seg) - 1   # 减 SYNC_HALT
+        if n_mm > SEG_MAX:
+            print(f"[C3] BitLinear '{seg_names[i]}' (idx={i}) 单段 MATMUL {n_mm} "
+                  f"> {SEG_MAX}, 启用大段分块 (P2-6, cim_launch 多块门铃)",
+                  file=sys.stderr)
 
     # ---- 读 weights, 建 dest_id -> tile_2bit (1024B) ----
     weights = read_weight_blob(weights_path)

@@ -36,7 +36,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from torch_mlir import ir
-from torch_mlir.dialects import torch as torch_d, func as func_d
+from torch_mlir.dialects import torch as torch_d, func as func_d, arith as arith_d, tensor as tensor_d
 from torch_mlir.fx import _module_lowering
 from torch_mlir.compiler_utils import OutputType, run_pipeline_with_repro_report
 
@@ -57,6 +57,16 @@ def lower_linalg_to_cim_call(mod) -> int:
         return ir.WalkResult.ADVANCE
 
     mod.operation.walk(find)
+
+    # [A1] 单一 @cim_launch 声明 (动态 shape, 任意规模统一; idx 常量参数)
+    i64_type = ir.IntegerType.get_signless(64, ctx)
+    dyn_i8 = ir.Type.parse("tensor<?x?xi8>", ctx)
+    dyn_i32 = ir.Type.parse("tensor<?x?xi32>", ctx)
+    launch_ft = ir.FunctionType.get(inputs=[i64_type, dyn_i8, dyn_i8],
+                                    results=[dyn_i32], context=ctx)
+    with ctx, ir.InsertionPoint.at_block_begin(mod.body):
+        func_d.FuncOp(name="cim_launch", type=launch_ft, visibility="private",
+                      loc=ir.Location.unknown(ctx))
 
     for idx, mm in enumerate(matmuls):
         loc = mm.location
@@ -86,24 +96,19 @@ def lower_linalg_to_cim_call(mod) -> int:
         if hasattr(outs_v.owner, "name"):  # OpResult -> Operation
             fill = outs_v.owner
 
-        # ---- 声明 @cim_launch_<idx> (private, tensor signature) ----
-        sym = f"cim_launch_{idx}"
-        func_type = ir.FunctionType.get(
-            inputs=[X_si8.type, W_packed.type],
-            results=[si32_result.type],
-            context=ctx,
-        )
-        with ir.InsertionPoint.at_block_begin(mod.body):
-            func_d.FuncOp(name=sym, type=func_type, visibility="private", loc=loc)
-
-        # ---- 插入 func.call (在 matmul 之前) ----
+        # ---- 插入 func.call @cim_launch(idx, X, W) [A1] cast 到动态 shape (单一 declare) ----
         with ir.InsertionPoint(mm):
-            call = func_d.CallOp([si32_result.type], sym, [X_si8, W_packed], loc=loc)
+            idx_const = arith_d.ConstantOp(i64_type, ir.IntegerAttr.get(i64_type, idx), loc=loc)
+            x_dyn = tensor_d.CastOp(dyn_i8, X_si8, loc=loc).result
+            w_dyn = tensor_d.CastOp(dyn_i8, W_packed, loc=loc).result
+            call = func_d.CallOp([dyn_i32], "cim_launch",
+                                 [idx_const.result, x_dyn, w_dyn], loc=loc)
+            res_back = tensor_d.CastOp(si32_result.type, call.results[0], loc=loc).result
 
-        # ---- 替换 si32 -> call result, 删死链 ----
+        # ---- 替换 si32 -> res_back (cast 回具体 shape), 删死链 ----
         # 只 erase result 无 use 的 op; fill 常被多个 matmul 共享为 init buffer (uses>0),
         # erase 有 use 的 op 会 segfault, 留给 canonicalize。
-        si32_result.replace_all_uses_with(call.results[0])
+        si32_result.replace_all_uses_with(res_back)
         kill = [fptosi_gen, mm, uitofp_gen, transpose, collapse, broadcast_gen, sitofp_gen]
         if fill is not None:
             kill.append(fill)

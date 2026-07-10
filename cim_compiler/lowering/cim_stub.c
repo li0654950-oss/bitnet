@@ -177,80 +177,54 @@ static Memref2D cim_launch_impl(const int8_t *x, const uint8_t *w,
     return r;
 }
 
-/* ===== 37 个 @cim_launch_<idx>: MMIO 驱动 Forward (M 循环), 否则 fallback =====
- * 单 token 指令流重复 M 次 (方案 C, seq_len 运行时吸收); 指令区写一次, M 次门铃+IRQ。
+/* ===== [A1] 单一 @cim_launch(idx, X, W): MMIO 驱动 Forward, idx 参数查 forward.bin 段 =====
+ * 固定硬件驱动: .so 一次编译, 任意规模复用 (idx 由 L3 传常量, 规模变只改 forward.bin + IR)。
+ * 单 token 指令流重复 M 次 (方案 C, seq_len 运行时吸收); 大段分块 (P2-6)。
  * A_PAGE/PSUM_PAGE 串行复用 (首 k_blk ACCUM=0 清旧 acc, 固化在指令里)。
  */
-#define DEF_LAUNCH(IDX)                                                        \
-Memref2D cim_launch_##IDX(                                                     \
-    void *xa, void *xaa, int64_t xoff, int64_t M, int64_t K,                   \
-    int64_t xs0, int64_t xs1,                                                  \
-    void *wa, void *waa, int64_t woff, int64_t N, int64_t K4,                  \
-    int64_t ws0, int64_t ws1) {                                                \
-    (void)xa; (void)xs0; (void)xs1; (void)wa; (void)ws0; (void)ws1;            \
-    const int8_t *x = (const int8_t *)((const char *)xaa + xoff);              \
-    const uint8_t *w = (const uint8_t *)((const char *)waa + woff);            \
-    if (!HW_READY) return cim_launch_impl(x, w, M, K, N, K4);                 \
-    int64_t n_tiles = (N + TILE - 1) / TILE;                                   \
-    int64_t k_tiles = (K + TILE - 1) / TILE;                                   \
-    int32_t *result = (int32_t *)malloc((size_t)M * (size_t)N * sizeof(int32_t)); \
-    /* 写指令区一次 (idx 查 forward.bin, 含物理 PAGE a_page/psum_page/accum) */  \
-    shm_write((long)INSTR_BASE * PAGE,                                         \
-              g_fwd_base + g_fwd_off[IDX], g_fwd_len[IDX]);                    \
-    for (int64_t m = 0; m < M; m++) {                                          \
-        /* 写 A_PAGE (按 k_blk 切, 每 64 int8) -- §4.7.3 */                     \
-        for (int64_t kb = 0; kb < k_tiles; kb++)                               \
-            shm_write((long)(A_PAGE_BASE + kb) * PAGE,                         \
-                      x + m * K + kb * TILE, TILE);                            \
-        /* 门铃 -> 取指执行 (MATMUL: A_PAGE × Macro -> PSUM_PAGE RMW) */        \
-        reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);               \
-        while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;  /* poll IRQ */   \
-        /* 读 PSUM_PAGE acc[m] (按 n_blk 拼, 取 valid 行) -- §4.7.5 */          \
-        for (int64_t nb = 0; nb < n_tiles; nb++) {                             \
-            int32_t acc_buf[TILE];                                             \
-            shm_read((long)(PSUM_PAGE_BASE + nb) * PAGE, acc_buf, PAGE);       \
-            int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;             \
-            memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t)); \
-        }                                                                      \
-        reg_write((long)INT_CLEAR_REG, 1);                                     \
-    }                                                                          \
-    Memref2D r = {result, result, 0, M, N, N, 1}; return r;                    \
+Memref2D cim_launch(int64_t idx,
+                    void *xa, void *xaa, int64_t xoff, int64_t M, int64_t K,
+                    int64_t xs0, int64_t xs1,
+                    void *wa, void *waa, int64_t woff, int64_t N, int64_t K4,
+                    int64_t ws0, int64_t ws1) {
+    (void)xa; (void)xs0; (void)xs1; (void)wa; (void)ws0; (void)ws1;
+    const int8_t *x = (const int8_t *)((const char *)xaa + xoff);
+    const uint8_t *w = (const uint8_t *)((const char *)waa + woff);
+    if (!HW_READY) return cim_launch_impl(x, w, M, K, N, K4);
+    int64_t n_tiles = (N + TILE - 1) / TILE;
+    int64_t k_tiles = (K + TILE - 1) / TILE;
+    int32_t *result = (int32_t *)malloc((size_t)M * (size_t)N * sizeof(int32_t));
+    /* [P2-6] 大段分块: 单段 > 681 MATMUL 时拆块 (指令区 4KB=682 条, 留 1 SYNC_HALT)
+       每块 ≤ 681 MATMUL + 末尾 SYNC_HALT, M 循环内多块门铃, 跨块 PSUM_PAGE RMW 累加保留
+       (doorbell 只清 busy_until/page_busy 时序, 不清 cache 数据; accum 字段固化保证 K维顺序) */
+    const int64_t SEG_MAX = 681;
+    int64_t n_mm = (int64_t)g_fwd_len[idx] / 6 - 1;  /* MATMUL 数 (减末尾 SYNC_HALT), idx 查 forward.bin */
+    int64_t n_blk = (n_mm + SEG_MAX - 1) / SEG_MAX;  /* 块数 (1=不分块) */
+    static const uint8_t HALT[6] = {0,0,0,0,0,0xE0};  /* SYNC_HALT word (0x7<<45 小端) */
+    for (int64_t m = 0; m < M; m++) {
+        /* 写 A_PAGE (按 k_blk 切, 每 64 int8) -- §4.7.3 */
+        for (int64_t kb = 0; kb < k_tiles; kb++)
+            shm_write((long)(A_PAGE_BASE + kb) * PAGE,
+                      x + m * K + kb * TILE, TILE);
+        /* 分块门铃: 每块 ≤ 681 MATMUL + 末尾 SYNC_HALT (跨块 PSUM_PAGE 累加) */
+        int64_t mm_done = 0;
+        for (int64_t b = 0; b < n_blk; b++) {
+            int64_t blk_mm = (mm_done + SEG_MAX <= n_mm) ? SEG_MAX : (n_mm - mm_done);
+            shm_write((long)INSTR_BASE * PAGE,
+                      g_fwd_base + g_fwd_off[idx] + mm_done * 6, blk_mm * 6);
+            shm_write((long)INSTR_BASE * PAGE + blk_mm * 6, (const void *)HALT, 6);
+            reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+            while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;  /* poll IRQ */
+            reg_write((long)INT_CLEAR_REG, 1);
+            mm_done += blk_mm;
+        }
+        /* 读 PSUM_PAGE acc[m] (按 n_blk 拼, 取 valid 行) -- §4.7.5 */
+        for (int64_t nb = 0; nb < n_tiles; nb++) {
+            int32_t acc_buf[TILE];
+            shm_read((long)(PSUM_PAGE_BASE + nb) * PAGE, acc_buf, PAGE);
+            int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
+            memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
+        }
+    }
+    Memref2D r = {result, result, 0, M, N, N, 1}; return r;
 }
-
-DEF_LAUNCH(0)
-DEF_LAUNCH(1)
-DEF_LAUNCH(2)
-DEF_LAUNCH(3)
-DEF_LAUNCH(4)
-DEF_LAUNCH(5)
-DEF_LAUNCH(6)
-DEF_LAUNCH(7)
-DEF_LAUNCH(8)
-DEF_LAUNCH(9)
-DEF_LAUNCH(10)
-DEF_LAUNCH(11)
-DEF_LAUNCH(12)
-DEF_LAUNCH(13)
-DEF_LAUNCH(14)
-DEF_LAUNCH(15)
-DEF_LAUNCH(16)
-DEF_LAUNCH(17)
-DEF_LAUNCH(18)
-DEF_LAUNCH(19)
-DEF_LAUNCH(20)
-DEF_LAUNCH(21)
-DEF_LAUNCH(22)
-DEF_LAUNCH(23)
-DEF_LAUNCH(24)
-DEF_LAUNCH(25)
-DEF_LAUNCH(26)
-DEF_LAUNCH(27)
-DEF_LAUNCH(28)
-DEF_LAUNCH(29)
-DEF_LAUNCH(30)
-DEF_LAUNCH(31)
-DEF_LAUNCH(32)
-DEF_LAUNCH(33)
-DEF_LAUNCH(34)
-DEF_LAUNCH(35)
-DEF_LAUNCH(36)

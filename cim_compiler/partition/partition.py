@@ -90,18 +90,24 @@ def _find_w_packed(node: fx.Node) -> Optional[fx.Node]:
     return None
 
 
-def _parse_bitlinear_name(w_packed_name: str) -> str:
-    """从 w_packed placeholder 名解析 BitLinear 路径。
+def _parse_bitlinear_name(name: str) -> str:
+    """[P1-4] 从 w_packed target/placeholder 名解析 BitLinear 路径 -> layers.0.attn.q.proj。
 
-    export placeholder 名形如 b_layers_0_attn_q_proj_w_packed
-    -> layers.0.attn.q.proj (数字段是 layer index, 下划线还原为点)。
+    兼容三种命名 (鲁棒):
+      target 名     : m.layers.0.attn.q_proj.w_packed  (export graph_signature, 最稳定)
+      placeholder 名: b_m_layers_0_attn_q_proj_w_packed (新 export, 含 m_ 模块根)
+      placeholder 名: b_layers_0_attn_q_proj_w_packed   (旧 export, 无 m_)
+    去 b_/p_ + m./m_ 模块根前缀 + .w_packed/_w_packed 后缀, _ -> . 还原层级 (与 emit_instr._norm 一致)。
     """
-    name = w_packed_name
     for prefix in ("b_", "p_"):
         if name.startswith(prefix):
             name = name[len(prefix):]
             break
-    for suffix in ("_w_packed", "_weight"):
+    if name.startswith("m."):
+        name = name[2:]
+    elif name.startswith("m_"):
+        name = name[2:]
+    for suffix in (".w_packed", "_w_packed", ".weight", "_weight"):
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
@@ -148,6 +154,12 @@ def partition_graph(prog) -> Partition:
         if n.op in ("call_function", "placeholder"):
             node_backend_map[n.name] = node_backend(n, cim_set)
 
+    # [P1-4] placeholder name -> target 名映射 (target 名 m.layers.0... 更稳定, 不依赖 b_/p_ 前缀)
+    ph_to_target = {}
+    for s in prog.graph_signature.input_specs:
+        if s.arg is not None and s.target:
+            ph_to_target[s.arg.name] = s.target
+
     # CIM 块: 每个 cim.matmul op 一个 (无解包链, 解包在 op 内)
     cim_blocks = []
     cpu_to_cim = []
@@ -158,7 +170,9 @@ def partition_graph(prog) -> Partition:
         x_int8 = mm.args[0]                # CPU->CIM 边界 (激活 int8)
         w_node = mm.args[1]                 # w_packed (custom op 直接传, 无解包链)
         w_packed = _find_w_packed(w_node)
-        bitlinear_name = _parse_bitlinear_name(w_packed.name) if w_packed else "?"
+        wp_name = w_packed.name if w_packed else "?"
+        target = ph_to_target.get(wp_name, wp_name)   # 优先 target 名 (鲁棒)
+        bitlinear_name = _parse_bitlinear_name(target) if w_packed else "?"
 
         cim_blocks.append(CimBlock(
             idx=idx,

@@ -162,24 +162,55 @@ def register_cim_hw_sim(so_path, sim):
     return lib
 
 
-def build_inputs(model, n_layer, idx):
-    """50 个 numpy input (按 main signature 顺序)。
+DEFAULT_PT2 = os.path.join(REPO, "checkpoints", "bitnet_ternary.pt2")
+_ep_cache = {}
 
-    每层: [inv_freq f32<32>, causal_mask i1<1x1xBxB>, q/k/v/o/fc1/fc2 w_packed i8]
-    + lm_head.w_packed + idx。w_packed uint8 -> view int8 (MLIR i8)。
-    idx: torch.long [1, T] (自回归时可变)。
+
+def _resolve_attr(model, target):
+    """m.layers.0.attn.q_proj.w_packed -> model.layers[0].attn.q_proj.w_packed"""
+    obj = model
+    for p in target.split('.'):
+        if p == 'm':
+            continue
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    return obj
+
+
+def build_inputs(model, idx, exported_program=None):
+    """[P0-2] 签名驱动: 从 ExportedProgram.graph_signature.input_specs 按 placeholder 顺序构造 input。
+
+    跳过 PARAMETER (constant-fold 内嵌), BUFFER 按 target 名解析 model 属性,
+    USER_INPUT 用 idx。任意 attn/mlp 拓扑 + 任意 n_layer 自动适配 (不硬编码子结构)。
     """
+    if exported_program is None:
+        exported_program = _ep_cache.get("default")
+        if exported_program is None:
+            try:
+                import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
+            except ImportError:
+                pass
+            exported_program = torch.export.load(DEFAULT_PT2)
+            _ep_cache["default"] = exported_program
     args = []
-    for li in range(n_layer):
-        a = model.layers[li].attn
-        m = model.layers[li].mlp
-        args.append(a.inv_freq.numpy().astype(np.float32))
-        args.append(a.causal_mask.numpy().astype(np.bool_))
-        for w in [a.q_proj.w_packed, a.k_proj.w_packed, a.v_proj.w_packed,
-                  a.o_proj.w_packed, m.fc1.w_packed, m.fc2.w_packed]:
-            args.append(np.ascontiguousarray(w.numpy()).view(np.int8))
-    args.append(np.ascontiguousarray(model.lm_head.w_packed.numpy()).view(np.int8))
-    args.append(np.ascontiguousarray(idx.numpy()))
+    for s in exported_program.graph_signature.input_specs:
+        kind = s.kind.name
+        if kind == 'PARAMETER':
+            continue  # constant-fold 内嵌, 不作 runtime input
+        if kind == 'USER_INPUT':
+            args.append(np.ascontiguousarray(idx.numpy()))
+            continue
+        # BUFFER: target 名解析 model 属性, 按后缀定类型
+        t = s.target
+        val = _resolve_attr(model, t)
+        val = val.numpy() if hasattr(val, 'numpy') else np.asarray(val)
+        if t.endswith('w_packed'):
+            args.append(np.ascontiguousarray(val).view(np.int8))   # uint8 -> i8
+        elif 'inv_freq' in t:
+            args.append(val.astype(np.float32))
+        elif 'causal_mask' in t:
+            args.append(val.astype(np.bool_))
+        else:
+            args.append(np.ascontiguousarray(val))
     return args
 
 
@@ -191,6 +222,14 @@ def main():
     p.add_argument("--T", type=int, default=8)
     p.add_argument("--sim", action="store_true",
                    help="方案 A: 注册 CIM 指令级仿真器回调 (否则用 cim_stub CPU 算 fallback)")
+    # [P0-3] 模型结构参数 (任意规模, 须与 ternary.pt 一致)
+    p.add_argument("--vocab_size", type=int, default=65)
+    p.add_argument("--d_model", type=int, default=512)
+    p.add_argument("--block_size", type=int, default=256)
+    p.add_argument("--n_layer", type=int, default=6)
+    p.add_argument("--n_head", type=int, default=8)
+    p.add_argument("--n_kv_head", type=int, default=4)
+    p.add_argument("--ffn_dim", type=int, default=1664)
     args = p.parse_args()
 
     print("[L6] 构建 LLVM mod (in-memory L2+L3+L4)...", file=sys.stderr)
@@ -213,9 +252,12 @@ def main():
               f"({len(sim.macros.macro)} Macro 预载)", file=sys.stderr)
 
     from inference_model import build_inference_model
-    model = build_inference_model(args.ternary, vocab_size=65)
+    model = build_inference_model(args.ternary, vocab_size=args.vocab_size,
+                                  d_model=args.d_model, block_size=args.block_size,
+                                  n_layer=args.n_layer, n_head=args.n_head,
+                                  n_kv_head=args.n_kv_head, ffn_dim=args.ffn_dim)
     idx = torch.zeros(1, args.T, dtype=torch.long)
-    inputs = build_inputs(model, 6, idx)
+    inputs = build_inputs(model, idx)
     print(f"[L6] {len(inputs)} input 构造完成, invoke main (T={args.T})...", file=sys.stderr)
 
     logits = invoker.invoke("main", *inputs)

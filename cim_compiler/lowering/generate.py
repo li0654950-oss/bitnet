@@ -41,7 +41,7 @@ def jit_generate(invoker, model, prompt, n, block_size):
     for i in range(n):
         if idx.shape[1] >= block_size:
             idx = idx[:, -block_size:]
-        inputs = _build_inputs(model, 6, idx)
+        inputs = _build_inputs(model, idx)
         logits = np.asarray(invoker.invoke("main", *inputs))
         nxt = int(np.argmax(logits[0, -1]))
         tokens.append(nxt)
@@ -78,10 +78,10 @@ def _build_weights(model, n_layer):
     return w
 
 
-def _build_inputs(model, n_layer, idx):
-    """复用 cim_jit.build_inputs (每步重建权重, n 小可接受)。"""
+def _build_inputs(model, idx):
+    """复用 cim_jit.build_inputs (签名驱动, 任意规模)。"""
     import cim_jit as _cj  # 已由 _load_cim_jit 注入
-    return _cj.build_inputs(model, n_layer, idx)
+    return _cj.build_inputs(model, idx)
 
 
 def main():
