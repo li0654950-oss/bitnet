@@ -12,6 +12,9 @@ pipeline -> LLVM IR), 用 ExecutionEngine JIT 执行 main:
   - invoke main -> logits, 对比 PyTorch reference (model(idx)[0])
 
 main 的 w_packed 是 i8 (MLIR 无 ui8), C stub 按 uint8 解释。
+
+方案 A (系统级仿真): cim_stub.c 的 cim_launch_<idx> 调 Python CIM 指令级仿真器
+  (register_cim_sim_callback), 走真实 func.call + JIT 链路, 与现有架构一致。
 """
 import os
 import sys
@@ -117,13 +120,41 @@ class CIMInvoker:
         return result
 
 
-def build_inputs(model, n_layer, T):
+# ---- 方案 A: CIM 指令级仿真器回调 (cim_stub.c cim_launch_<idx> -> Python) ----
+# 回调签名匹配 cim_stub.c: void(int idx, int8* x, int64 M, int64 K, uint8* w, int64 N, int64 K4, int32* out)
+_CIM_SIM_CB = ctypes.CFUNCTYPE(None, ctypes.c_int,
+                               ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                               ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
+                               ctypes.c_void_p)
+
+
+def register_cim_sim_callback(so_path, sim):
+    """ctypes 加载 cim_stub.so, 注册 Python 回调 py_cim_sim -> sim.simulate。
+    cim_stub.c 的 cim_launch_<idx> 调此回调 (传 x/w 指针+idx), 回调写 result buffer。
+    返回 lib (持有回调引用, 调用方须保持存活)。"""
+    lib = ctypes.CDLL(so_path)
+
+    @_CIM_SIM_CB
+    def py_cim_sim(idx, x_ptr, M, K, w_ptr, N, K4, out_ptr):
+        # 从 C 指针读 x[M,K] int8 + w[N,K4] uint8 (main 的 w_packed, i8->uint8)
+        x = np.ctypeslib.as_array(ctypes.cast(x_ptr, ctypes.POINTER(ctypes.c_int8)), (M, K))
+        w = np.ctypeslib.as_array(ctypes.cast(w_ptr, ctypes.POINTER(ctypes.c_uint8)), (N, K4))
+        acc = sim.simulate(idx, x, w)                       # [M,N] int32 (指令级, idx->Macro)
+        out = np.ctypeslib.as_array(ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_int32)), (M, N))
+        out[:] = acc                                        # 写回 C malloc 的 result buffer
+
+    lib.register_cim_simulator(py_cim_sim)
+    lib._py_cim_sim = py_cim_sim                            # 保持回调对象存活 (防 GC)
+    return lib
+
+
+def build_inputs(model, n_layer, idx):
     """50 个 numpy input (按 main signature 顺序)。
 
     每层: [inv_freq f32<32>, causal_mask i1<1x1xBxB>, q/k/v/o/fc1/fc2 w_packed i8]
     + lm_head.w_packed + idx。w_packed uint8 -> view int8 (MLIR i8)。
+    idx: torch.long [1, T] (自回归时可变)。
     """
-    idx = torch.zeros(1, T, dtype=torch.long)
     args = []
     for li in range(n_layer):
         a = model.layers[li].attn
@@ -134,8 +165,8 @@ def build_inputs(model, n_layer, T):
                   a.o_proj.w_packed, m.fc1.w_packed, m.fc2.w_packed]:
             args.append(np.ascontiguousarray(w.numpy()).view(np.int8))
     args.append(np.ascontiguousarray(model.lm_head.w_packed.numpy()).view(np.int8))
-    args.append(idx.numpy())
-    return args, idx
+    args.append(np.ascontiguousarray(idx.numpy()))
+    return args
 
 
 def main():
@@ -144,6 +175,8 @@ def main():
     p.add_argument("--ternary", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
     p.add_argument("--so", default=os.path.join(HERE, "cim_stub.so"))
     p.add_argument("--T", type=int, default=8)
+    p.add_argument("--sim", action="store_true",
+                   help="方案 A: 注册 CIM 指令级仿真器回调 (否则用 cim_stub CPU 算 fallback)")
     args = p.parse_args()
 
     print("[L6] 构建 LLVM mod (in-memory L2+L3+L4)...", file=sys.stderr)
@@ -153,9 +186,23 @@ def main():
     invoker = CIMInvoker(mod, args.so)
     print(f"[L6] ExecutionEngine + cim_stub.so 加载完成", file=sys.stderr)
 
+    sim_lib = None
+    if args.sim:
+        from cim_compiler.cimres.hw_simulator import HwCimSimulator
+        sim = HwCimSimulator(
+            os.path.join(REPO, "cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir"),
+            os.path.join(REPO, "checkpoints/bitnet_ternary_weights.bin"),
+            os.path.join(REPO, "checkpoints/bitnet_ternary_partition.json"),
+        )
+        sim.preload_phase()  # Preload Phase: PROG_WGT 取指预载 Macro (硬件级)
+        sim_lib = register_cim_sim_callback(args.so, sim)
+        print(f"[L6] 硬件级 CIM 仿真器回调已注册 (方案 A, preload_phase {len(sim.macros.macro)} Macro)",
+              file=sys.stderr)
+
     from inference_model import build_inference_model
     model = build_inference_model(args.ternary, vocab_size=65)
-    inputs, idx = build_inputs(model, 6, args.T)
+    idx = torch.zeros(1, args.T, dtype=torch.long)
+    inputs = build_inputs(model, 6, idx)
     print(f"[L6] {len(inputs)} input 构造完成, invoke main (T={args.T})...", file=sys.stderr)
 
     logits = invoker.invoke("main", *inputs)
@@ -166,7 +213,8 @@ def main():
     diff = np.abs(logits.astype(np.float64) - ref.astype(np.float64))
     print(f"[L6] max abs diff = {diff.max():.4f}, mean = {diff.mean():.4f}", file=sys.stderr)
     ok = diff.max() < 1.0
-    print(f"\n[L6] {'PASS ✓ (JIT logits ≈ PyTorch reference, func.call stub 正确接入)' if ok else 'FAIL ✗'}",
+    mode = "方案A CIM 指令级仿真器" if args.sim else "cim_stub CPU 算 fallback"
+    print(f"\n[L6] {'PASS ✓ (' + mode + ', func.call 正确接入)' if ok else 'FAIL ✗'}",
           file=sys.stderr)
     sys.exit(0 if ok else 1)
 

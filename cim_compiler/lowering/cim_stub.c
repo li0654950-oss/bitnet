@@ -7,11 +7,15 @@
  *   W: ui8 [N, K/4]  2bit 补码打包三值权重
  *   -> result: si32 [M, N]  累加输出
  *
- * 语义同 cim_op.cim_matmul: unpack W (ternary) + int matmul -> int32。
  * 37 个 cim_launch_<idx> 逻辑相同 (sizes 从 memref descriptor 读), 用 macro 生成。
+ *
+ * 方案 A (系统级仿真): cim_launch_<idx> 优先调 Python CIM 指令级仿真器 (g_cim_sim_cb 回调),
+ *   回调写 result buffer, C 包装成 Memref2D 返回 (绕过 ctypes 不能返回 struct by value)。
+ *   未注册回调 (NULL) 时 fallback 到 cim_launch_impl (CPU 算 matmul, 兼容旧路径)。
  *
  * 编译: cc -O2 -shared -fPIC cim_stub.c -o cim_stub.so
  * 用法: ExecutionEngine(mod, shared_libs=["cim_stub.so"])
+ *        + cim_jit.py register_cim_simulator(py_cim_sim)  (方案 A)
  */
 #include <stdlib.h>
 #include <stdint.h>
@@ -23,6 +27,16 @@ typedef struct {
     int64_t size0, size1;
     int64_t stride0, stride1;
 } Memref2D;
+
+/* 方案 A: Python CIM 指令级仿真器回调 (cim_jit.py register_cim_simulator 注册)。
+ * cim_launch_<idx> 调此回调把计算委托 Python 仿真器, 回调写 out (int32[M*N]),
+ * C 包装成 Memref2D 返回。未注册时 fallback CPU 算。 */
+typedef void (*cim_sim_cb_t)(int idx,
+                             const int8_t *x, int64_t M, int64_t K,
+                             const uint8_t *w, int64_t N, int64_t K4,
+                             int32_t *out);
+static cim_sim_cb_t g_cim_sim_cb = NULL;
+void register_cim_simulator(cim_sim_cb_t cb) { g_cim_sim_cb = cb; }
 
 /* uint8[N, K4] (2bit 补码) -> int8[N, K] {-1,0,1}。同 cim_op.unpack_2bit_aten。 */
 static void unpack_2bit(const uint8_t *packed, int8_t *out, int64_t N, int64_t K4) {
@@ -39,6 +53,7 @@ static void unpack_2bit(const uint8_t *packed, int8_t *out, int64_t N, int64_t K
     }
 }
 
+/* fallback: CPU 算 matmul (unpack W + int matmul -> int32)。无 Python 回调时用。 */
 static Memref2D cim_launch_impl(const int8_t *x, const uint8_t *w,
                                 int64_t M, int64_t K, int64_t N, int64_t K4) {
     int8_t *w_int = (int8_t *)malloc(N * K);
@@ -60,7 +75,7 @@ static Memref2D cim_launch_impl(const int8_t *x, const uint8_t *w,
     return r;
 }
 
-/* 37 个 @cim_launch_<idx> wrapper (逻辑相同, calling convention 一致)。 */
+/* 37 个 @cim_launch_<idx> wrapper: 优先调 Python 仿真器回调, 否则 fallback CPU 算。 */
 #define DEF_LAUNCH(IDX)                                                        \
     Memref2D cim_launch_##IDX(                                                 \
         void *xa, void *xaa, int64_t xoff, int64_t M, int64_t K,               \
@@ -70,6 +85,12 @@ static Memref2D cim_launch_impl(const int8_t *x, const uint8_t *w,
         (void)xa; (void)xs0; (void)xs1; (void)wa; (void)ws0; (void)ws1;        \
         const int8_t *x = (const int8_t *)((const char *)xaa + xoff);          \
         const uint8_t *w = (const uint8_t *)((const char *)waa + woff);        \
+        if (g_cim_sim_cb) {                                                    \
+            int32_t *result = (int32_t *)malloc((size_t)M * (size_t)N * sizeof(int32_t)); \
+            g_cim_sim_cb(IDX, x, M, K, w, N, K4, result);                      \
+            Memref2D r = {result, result, 0, M, N, N, 1};                      \
+            return r;                                                          \
+        }                                                                      \
         return cim_launch_impl(x, w, M, K, N, K4);                            \
     }
 
