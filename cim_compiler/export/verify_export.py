@@ -3,7 +3,7 @@
 
 校验:
   1. .pt2 可加载, BOS forward 与变长 seq forward 数值均与 eager 推理模型一致
-  2. 图节点: matmul 计数 (= BitLinear 数) / custom op (=0) / detach (=0, 无 STE 残留)
+  2. 图节点: cim.matmul op 计数 (= BitLinear 数) / aten.matmul (=0, 未内联) / detach (=0, 无 STE 残留)
   3. 算子分布
   4. weight blob 可读回, 每层 packed/scale/shape 与模型 buffer 一致
 
@@ -53,21 +53,21 @@ def main():
     for T, tag in [(1, "BOS"), (7, "seq=7")]:
         idx = torch.zeros(1, T, dtype=torch.long)
         with torch.no_grad():
-            ref = model(idx)[0]
-            got = prog.module()(idx)[0]
+            ref = model(idx)[0]            # BitNet 返回 (logits, None), 取 logits
+            got = prog.module()(idx)        # _LogitsOnly 返回 logits (无 None)
         d = (got - ref).abs().max().item()
         good = d < 1e-4
         ok &= good
         print(f"[数值] {tag}: export vs eager max|diff|={d:.4e} {'OK' if good else 'FAIL'}")
 
-    # 2) 图节点统计
-    n_matmul = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "matmul" in str(n.target))
-    n_custom = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "cim::" in str(n.target))
+    # 2) 图节点统计 (cim.matmul op 应保留为 op 节点, 不内联成 aten.matmul)
+    n_cim = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "cim.matmul" in str(n.target))
+    n_aten_mm = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "matmul" in str(n.target) and "cim.matmul" not in str(n.target))
     n_detach = sum(1 for n in prog.graph.nodes if "detach" in str(n.target))
     n_bl = sum(1 for m in model.modules() if isinstance(m, BitLinearInference))
-    g_ok = (n_matmul == n_bl and n_custom == 0 and n_detach == 0)
+    g_ok = (n_cim == n_bl and n_aten_mm == 0 and n_detach == 0)
     ok &= g_ok
-    print(f"[图] matmul={n_matmul} (应={n_bl}) | custom={n_custom} (应=0) | detach/STE={n_detach} (应=0) "
+    print(f"[图] cim.matmul={n_cim} (应={n_bl}) | aten.matmul={n_aten_mm} (应=0) | detach/STE={n_detach} (应=0) "
           f"{'OK' if g_ok else 'FAIL'}")
 
     ops = Counter(str(n.target).split(".")[-1] for n in prog.graph.nodes if n.op == "call_function")

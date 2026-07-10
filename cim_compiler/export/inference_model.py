@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""推理态固化模型 — BitNet b1.58 的纯原生 ATen 2bit 三值权重前向。
+"""推理态固化模型 - BitNet b1.58 的 cim::matmul custom op 2bit 三值权重前向。
 
 把训练态 BitLinear (STE 伪量化 + F.linear) 替换为推理态 BitLinearInference:
-  norm → per-token int8 量化 → 2bit 打包权重解包 (原生 ATen) → float matmul (int32) → rescale
+  norm -> per-token int8 量化 -> cim::matmul (int8 × 2bit 打包 -> int32) -> rescale
 
-权重以 2bit 补码打包 uint8[N, K//4] 常量固化 (4 code/byte, -1→0b11, 0→0b00, +1→0b01)。
-整条前向是纯原生 ATen 算子, 可被 torch.export 捕获, 零 custom op 注册。
+权重以 2bit 补码打包 uint8[N, K//4] 常量固化 (4 code/byte, -1->0b11, 0->0b00, +1->0b01)。
+矩阵乘用注册的 cim::matmul custom op (见 cim_op.py), torch.export 保留为 op 节点不内联,
+使 CPU/CIM 在 IR 里天然分离 (CPU 量化/rescale, CIM=cim.matmul op)。
 
 对应 cim_mlp.md 的 CIM 定点通路:
-  int8 激活 × 2bit 节点 → int32 累加 → CPU rescale (FP32 留 CPU 侧, 不写回共享缓存)。
+  int8 激活 × 2bit 节点 -> int32 累加 -> CPU rescale (FP32 留 CPU 侧, 不写回共享缓存)。
 """
 import os
 import sys
@@ -23,32 +24,15 @@ import torch
 import torch.nn as nn
 
 from model import BitNet, BitLinear  # noqa: E402
-
-
-def unpack_2bit_aten(packed: torch.Tensor) -> torch.Tensor:
-    """uint8[..., K//4] (2bit 补码) -> int8[..., K] {-1,0,1}。
-
-    纯原生 ATen 算子链 (可被 torch.export 捕获):
-      bit_and(0x3) + rshift(2/4/6) → 4 路取 code → stack/reshape → where(code>=2, code-4, code)
-    与 export_ternary.unpack_2bit 数值完全一致 (已验证 max|diff|=0)。
-    """
-    p = packed.to(torch.int32)
-    # 用 div/mod 替代 bitwise (torch-mlir 20240127 对 int bitwise_and/rshift 降级不全; p 非负, div/mod 等价)
-    c0 = p % 4
-    c1 = (p // 4) % 4
-    c2 = (p // 16) % 4
-    c3 = (p // 64) % 4
-    code = torch.stack([c0, c1, c2, c3], dim=-1).reshape(*packed.shape[:-1], -1)
-    # 2bit 补码: 0->0, 1->+1, 3->-1 (2 未用)
-    return torch.where(code >= 2, code - 4, code).to(torch.int8)
+import cim_op  # noqa: E402, F401  (注册 cim::matmul custom op)
 
 
 class BitLinearInference(nn.Module):
-    """推理态 BitLinear: 2bit 打包三值权重 + 原生 ATen 定点前向。
+    """推理态 BitLinear: 2bit 打包三值权重 + cim::matmul 定点前向。
 
     持有原 BitLinear 的 nn.RMSNorm (norm 子模块)、2bit 打包权重 buffer (w_packed)、
     每张量 scale_w 标量。forward 对应 CIM 定点通路:
-      norm → per-token int8 量化 → 2bit 解包 → float matmul (int32) → rescale (FP32)
+      norm -> per-token int8 量化 -> cim::matmul (int8 × 2bit 打包 -> int32) -> rescale (FP32)
     """
     def __init__(self, norm: nn.Module, w_packed: torch.Tensor, scale_w: float):
         super().__init__()
@@ -62,10 +46,9 @@ class BitLinearInference(nn.Module):
         x_norm = self.norm(x).reshape(-1, K)                                   # [M, K]
         scale_x = 127.0 / x_norm.abs().max(dim=-1, keepdim=True).values.clamp_min(1e-5)  # [M, 1]
         x_int8 = (x_norm * scale_x).round().clamp(-128, 127).to(torch.int8)
-        w_int8 = unpack_2bit_aten(self.w_packed)                                 # [N, K] {-1,0,1}
-        # float matmul 替代 _int_mm (torch-mlir 对 _int_mm 降级不全;
-        # int8×{-1,0,1} 在 float32 精确 |acc|<=65536<2^24, 数值等价 _int_mm int32)
-        acc = (x_int8.to(torch.float32) @ w_int8.to(torch.float32).t()).to(torch.int32)
+        # cim::matmul custom op: int8 × 2bit 打包三值权重 -> int32 (CIM Macro)
+        # torch.export 保留为 op 节点不内联, CPU/CIM 在 IR 天然分离 (见 cim_op.py)
+        acc = torch.ops.cim.matmul(x_int8, self.w_packed)                       # [M, N] int32
         out = acc.to(torch.float32) / (scale_x * self.scale_w)                 # rescale, FP32 留 CPU 侧
         return out.reshape(*lead, -1)
 

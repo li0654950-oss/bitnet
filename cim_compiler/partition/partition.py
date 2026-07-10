@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""FX graph CPU/CIM 划分 — 产出逻辑子图 (节点标注 + 边界张量 + CIM 块)。
+"""FX graph CPU/CIM 划分 - 产出逻辑子图 (节点标注 + 边界张量 + CIM 块)。
 
 不修改 export 图: 遍历标注每节点 backend, 输出 CPU↔CIM 边界张量, 分组为 CPU/CIM 逻辑子图。
-为 compiler 后端提供调度依据 (CIM 节点 → Macro, CPU 节点 → CPU, 边界张量 = 共享缓存读写点)。
+为 compiler 后端提供调度依据 (CIM 节点 -> Macro, CPU 节点 -> CPU, 边界张量 = 共享缓存读写点)。
+
+custom op 模式 (cim::matmul): CIM 节点 = cim.matmul op 节点本身 (解包/累加封装在 op 内, 不内联),
+故 CIM 块 = 1 个 op 节点 (无解包链, 与内联 _int_mm 模式不同)。
 
 产物 partition.json:
   summary: {total, cpu, cim, cim_blocks}
   node_backend: {node_name: 'CPU'|'CIM'}
-  cim_blocks: [{idx, bitlinear_name, int_mm, w_packed, x_int8_in, acc_out, unpack_nodes}]
+  cim_blocks: [{idx, bitlinear_name, int_mm, w_packed, x_int8_in, acc_out}]
   boundaries: {cpu_to_cim: [...], cim_to_cpu: [...]}
 
 用法:
@@ -25,6 +28,11 @@ from typing import Optional
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+# 注册 cim::matmul custom op (torch.export.load 反序列化 .pt2 需要 op 已注册)
+_EXPORT_DIR = os.path.join(os.path.dirname(HERE), "export")
+if _EXPORT_DIR not in sys.path:
+    sys.path.insert(0, _EXPORT_DIR)
+import cim_op  # noqa: F401
 
 import torch
 import torch.export
@@ -37,11 +45,10 @@ from classify import mark_cim_nodes, node_backend, is_cim_matmul
 class CimBlock:
     idx: int
     bitlinear_name: str       # 对应 BitLinear 路径 (从 w_packed 名解析)
-    int_mm: str               # matmul 节点名
+    int_mm: str               # cim.matmul op 节点名
     w_packed: str             # w_packed placeholder 节点名
-    x_int8_in: str            # CPU→CIM 边界: 激活 int8 输入节点名
-    acc_out: str              # CIM→CPU 边界: int32 输出节点名 (matmul 本身)
-    unpack_nodes: list        # 解包链节点名列表
+    x_int8_in: str            # CPU->CIM 边界: 激活 int8 输入节点名
+    acc_out: str              # CIM->CPU 边界: int32 输出节点名 (cim.matmul op 本身)
 
 
 @dataclass
@@ -64,7 +71,8 @@ class Partition:
 def _find_w_packed(node: fx.Node) -> Optional[fx.Node]:
     """从权重侧节点反向追溯到 w_packed placeholder / get_attr。
 
-    处理 stack 等算子的 list/tuple args (节点在 list 内)。
+    custom op 模式: cim.matmul 的 args[1] 直接是 w_packed placeholder, 无需追溯解包链
+    (解包在 op 内部)。此函数保留追溯能力以兼容非直接传入的情况。
     """
     if node.op in ("placeholder", "get_attr"):
         return node
@@ -86,7 +94,7 @@ def _parse_bitlinear_name(w_packed_name: str) -> str:
     """从 w_packed placeholder 名解析 BitLinear 路径。
 
     export placeholder 名形如 b_layers_0_attn_q_proj_w_packed
-    → layers.0.attn.q.proj (数字段是 layer index, 下划线还原为点)。
+    -> layers.0.attn.q.proj (数字段是 layer index, 下划线还原为点)。
     """
     name = w_packed_name
     for prefix in ("b_", "p_"):
@@ -140,34 +148,17 @@ def partition_graph(prog) -> Partition:
         if n.op in ("call_function", "placeholder"):
             node_backend_map[n.name] = node_backend(n, cim_set)
 
-    # CIM 块: 每个 matmul 一个
+    # CIM 块: 每个 cim.matmul op 一个 (无解包链, 解包在 op 内)
     cim_blocks = []
     cpu_to_cim = []
     cim_to_cpu = []
 
     int_mms = [n for n in graph.nodes if is_cim_matmul(n)]
     for idx, mm in enumerate(int_mms):
-        x_int8 = mm.args[0]                # CPU→CIM 边界 (激活)
-        w_t = mm.args[1]                    # w_int8.t()
-        w_packed = _find_w_packed(w_t)      # 追溯到 placeholder
+        x_int8 = mm.args[0]                # CPU->CIM 边界 (激活 int8)
+        w_node = mm.args[1]                 # w_packed (custom op 直接传, 无解包链)
+        w_packed = _find_w_packed(w_node)
         bitlinear_name = _parse_bitlinear_name(w_packed.name) if w_packed else "?"
-
-        # 解包链: 权重侧追溯到 w_packed 的节点 (排除 mm 本身)
-        unpack = []
-        def collect(node, seen):
-            if node is mm or node in seen:
-                return
-            seen.add(node)
-            if node.op == "call_function":
-                unpack.append(node.name)
-            for a in node.args:
-                if isinstance(a, fx.Node):
-                    collect(a, seen)
-                elif isinstance(a, (list, tuple)):
-                    for x in a:
-                        if isinstance(x, fx.Node):
-                            collect(x, seen)
-        collect(w_t, set())
 
         cim_blocks.append(CimBlock(
             idx=idx,
@@ -176,7 +167,6 @@ def partition_graph(prog) -> Partition:
             w_packed=w_packed.name if w_packed else "?",
             x_int8_in=x_int8.name,
             acc_out=mm.name,
-            unpack_nodes=unpack,
         ))
         cpu_to_cim.append(Boundary(
             node=x_int8.name, direction="cpu_to_cim",
@@ -232,7 +222,7 @@ def main():
           f"cim_to_cpu={len(part.boundaries['cim_to_cpu'])}", file=sys.stderr)
     print(f"[partition] saved: {args.out}", file=sys.stderr)
     for b in part.cim_blocks[:5]:
-        print(f"  [{b.idx:2d}] {b.bitlinear_name}: unpack={len(b.unpack_nodes)} 节点, "
+        print(f"  [{b.idx:2d}] {b.bitlinear_name}: "
               f"x_in={b.x_int8_in}, acc={b.acc_out}", file=sys.stderr)
     if len(part.cim_blocks) > 5:
         print(f"  ... (共 {len(part.cim_blocks)} 个 CIM 块)", file=sys.stderr)

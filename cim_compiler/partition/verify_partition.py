@@ -21,6 +21,11 @@ import argparse
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+# 注册 cim::matmul custom op (torch.export.load 反序列化 .pt2 需要 op 已注册)
+_EXPORT_DIR = os.path.join(os.path.dirname(HERE), "export")
+if _EXPORT_DIR not in sys.path:
+    sys.path.insert(0, _EXPORT_DIR)
+import cim_op  # noqa: F401
 
 import torch
 import torch.export
@@ -78,11 +83,10 @@ def main():
     print(f"[数据流] {len(part['cim_blocks'])} 块 (x_in==mm.args[0], acc==mm) "
           f"{'OK' if c4 else f'FAIL: {bad}'}")
 
-    # 5. 边界 dtype
+    # 5. 边界 dtype (custom op: x_int8 int8 入 / acc int32 出)
     dt_in = set(b["dtype"] for b in part["boundaries"]["cpu_to_cim"])
     dt_out = set(b["dtype"] for b in part["boundaries"]["cim_to_cpu"])
-    # dtype: float matmul 替代 _int_mm (兼容 torch-mlir 降级), 边界 float32
-    c5 = any(d in ("int8", "float32") for d in dt_in) and any(d in ("int32", "float32") for d in dt_out)
+    c5 = any(d == "int8" for d in dt_in) and any(d == "int32" for d in dt_out)
     print(f"[dtype] cpu_to_cim={dt_in} cim_to_cpu={dt_out} {'OK' if c5 else '检查'}")
     ok &= c5
 
