@@ -28,12 +28,9 @@ MMIO (§2.3): shm (共享缓存, T_SHM) + reg (寄存器, T_REG) + cycle 统计�
 """
 import os
 import sys
-import math
 import time
-import struct
 import ctypes
 import threading
-import argparse
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,8 +40,6 @@ EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
 for _p in (REPO, EXPORT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-
-from cim_compiler.export.weight_blob import read_weight_blob
 
 TILE = 64
 SHARED_SIZE = 1 << 20
@@ -88,15 +83,15 @@ def unpack_2bit_np(packed):
     return np.where(code >= 2, code - 4, code).astype(np.int8)
 
 
-def _norm(name):
-    return name.replace("_", ".")
-
-
 # ===================== 硬件组件 (§2.2) =====================
 class SharedCache:
-    """1MB 共享缓存, PAGE 寻址, 三区 (§2.1/§4.6)。"""
-    def __init__(self):
-        self.data = np.zeros(SHARED_SIZE, dtype=np.uint8)
+    """1MB 共享缓存, PAGE 寻址, 三区 (§2.1/§4.6)。
+    shm_buf 非空时 data backed by POSIX 共享内存 (C/Python 共享, IPC 优化, AOT 模式用)。"""
+    def __init__(self, shm_buf=None):
+        if shm_buf is not None:
+            self.data = np.frombuffer(shm_buf, dtype=np.uint8, count=SHARED_SIZE)
+        else:
+            self.data = np.zeros(SHARED_SIZE, dtype=np.uint8)
         self.data32 = self.data.view(np.int32)
 
     def read_bytes(self, byte_addr, n):
@@ -251,9 +246,9 @@ class HwCimSimulator:
     """纯硬件 CIM 仿真器: MMIO 接口 + cycle 级时序统计。
     CPU (cim_stub.c) 经 MMIO 读写操作, 硬件门铃异步取指执行。"""
 
-    def __init__(self, reg_base=REG_BASE_DEFAULT):
+    def __init__(self, reg_base=REG_BASE_DEFAULT, shm_buf=None):
         sys.setswitchinterval(0.001)   # 1ms 线程切换 (门铃异步 poll 响应)
-        self.cache = SharedCache()
+        self.cache = SharedCache(shm_buf)
         self.macros = MacroArray()
         self.arbiter = UpstreamArbiter(self.cache)
         self.dispatcher = BusDispatcher(self.macros, self.cache, self.arbiter)
@@ -312,127 +307,3 @@ class HwCimSimulator:
             "mmio_cycle": self.mmio_cycle,
             "n_macro": len(self.macros.macro),
         }
-
-
-# ===================== Python 端 driver (模拟 cim_stub.c, self-test 用) =====================
-def driver_preload(sim, preload_path):
-    """模拟 cim_preload_init: 读 preload.bin (自包含), 分批 MMIO 驱动 Preload。"""
-    data = open(preload_path, "rb").read()
-    assert data[:4] == PRELOAD_MAGIC, f"bad preload magic: {data[:4]}"
-    n_batch = struct.unpack("<I", data[4:8])[0]
-    b_off = struct.unpack(f"<{n_batch}I", data[8:8 + n_batch * 4])
-    body = 8 + n_batch * 4
-    for off in b_off:
-        p = body + off
-        n_tile = struct.unpack("<I", data[p:p + 4])[0]
-        p += 4
-        tile_data = data[p:p + n_tile * 1024]
-        p += n_tile * 1024
-        instr_size = n_tile * 6 + 6
-        instrs = data[p:p + instr_size]
-        for i in range(n_tile):
-            sim._shm_write((OVERWRITE_BASE + i * 4) * PAGE,
-                           np.frombuffer(tile_data[i * 1024:(i + 1) * 1024], dtype=np.uint8))
-        sim._shm_write(INSTR_BASE * PAGE, np.frombuffer(instrs, dtype=np.uint8))
-        sim.mmio_reg_write(sim.DOORBELL_REG, INSTR_BASE * PAGE)   # 门铃 (异步)
-        sim.wait_irq()                                            # poll IRQ
-        sim.mmio_reg_write(sim.INT_CLEAR_REG, 1)
-
-
-def driver_forward_seg(forward_path, idx):
-    """读 forward.bin 的 idx 段 -> bytes (MATMUL...+SYNC_HALT)。"""
-    data = open(forward_path, "rb").read()
-    assert data[:4] == FORWARD_MAGIC, f"bad forward magic: {data[:4]}"
-    n_idx = struct.unpack("<I", data[4:8])[0]
-    assert idx < n_idx, f"idx {idx} >= n_idx {n_idx}"
-    off = struct.unpack(f"<{n_idx}I", data[8:8 + n_idx * 4])[idx]
-    length = struct.unpack(f"<{n_idx}I", data[8 + n_idx * 4:8 + 2 * n_idx * 4])[idx]
-    base = 8 + 2 * n_idx * 4
-    return data[base + off:base + off + length]
-
-
-def driver_launch(sim, forward_path, idx, x_int8_1d, N, K):
-    """模拟 cim_launch_<idx> 单 token: MMIO 驱动 Forward, 返回 (acc, cim_cycle)。"""
-    k_tiles = math.ceil(K / TILE)
-    n_tiles = math.ceil(N / TILE)
-    Kp = k_tiles * TILE
-    xpad = np.zeros(Kp, dtype=np.int8)
-    xpad[:K] = np.asarray(x_int8_1d, dtype=np.int8)
-    seg = driver_forward_seg(forward_path, idx)
-    sim._shm_write(INSTR_BASE * PAGE, np.frombuffer(seg, dtype=np.uint8))
-    for kb in range(k_tiles):
-        sim._shm_write((A_PAGE_BASE + kb) * PAGE,
-                       xpad[kb * TILE:(kb + 1) * TILE].astype(np.uint8))
-    sim.mmio_reg_write(sim.DOORBELL_REG, INSTR_BASE * PAGE)   # 门铃 (异步, _run 清 page_busy)
-    sim.wait_irq()                                          # poll IRQ
-    cim_cycle = sim.controller.cycle                        # 本次 Forward cycle
-    acc = np.zeros(N, dtype=np.int32)
-    for nb in range(n_tiles):
-        vec = sim._shm_read((PSUM_PAGE_BASE + nb) * PAGE, PAGE).view(np.int32)
-        s = nb * TILE
-        e = min(s + TILE, N)
-        acc[s:e] = vec[:e - s]
-    sim.mmio_reg_write(sim.INT_CLEAR_REG, 1)
-    return acc, cim_cycle
-
-
-def _self_test():
-    """Python driver (MMIO) 驱动纯硬件: Preload + Forward, 数值 + 时序统计。"""
-    import json
-    partition = "checkpoints/bitnet_ternary_partition.json"
-    weights = "checkpoints/bitnet_ternary_weights.bin"
-    preload = "cim_compiler/cimres/checkpoints/preload.bin"
-    forward = "cim_compiler/cimres/checkpoints/forward.bin"
-
-    sim = HwCimSimulator()
-    driver_preload(sim, preload)
-    pre_stats = sim.stats_snapshot()
-    print(f"[Hw] preload (MMIO driver): {len(sim.macros.macro)} Macro, "
-          f"cim_cycle={pre_stats['cim_cycle']}, mmio_cycle={pre_stats['mmio_cycle']}", file=sys.stderr)
-
-    part = json.load(open(partition))
-    idx2name = {blk["idx"]: blk["bitlinear_name"] for blk in part["cim_blocks"]}
-    weights_list = read_weight_blob(weights)
-    wmap = {_norm(w.name): w for w in weights_list}
-    w_ternary = {n: unpack_2bit_np(np.frombuffer(wmap[n].packed, dtype=np.uint8).reshape(wmap[n].N, wmap[n].K // 4))
-                 for n in idx2name.values()}
-
-    rng = np.random.default_rng(0)
-    max_diff = 0
-    n = 0
-    total_cim_cycle = 0
-    serial_cycle = 0   # 串行估算 (k_tiles*n_tiles*(T_DISPATCH+T_MATMUL+T_WB))
-    for idx in sorted(idx2name):
-        name = idx2name[idx]
-        we = wmap[name]
-        N, K = we.N, we.K
-        n_tiles = math.ceil(N / TILE)
-        k_tiles = math.ceil(K / TILE)
-        for M in (1, 3):
-            x = rng.integers(-128, 127, size=(M, K), dtype=np.int8)
-            acc_sim = np.zeros((M, N), dtype=np.int32)
-            cyc = 0
-            for m in range(M):                       # 动态 M 循环
-                a, c = driver_launch(sim, forward, idx, x[m], N, K)
-                acc_sim[m] = a
-                cyc += c
-            acc_ref = (x.astype(np.int32) @ w_ternary[name].astype(np.int32).T).astype(np.int32)
-            diff = int(np.max(np.abs(acc_sim.astype(np.int64) - acc_ref.astype(np.int64))))
-            max_diff = max(max_diff, diff)
-            n += 1
-            serial = k_tiles * n_tiles * (T_DISPATCH + T_MATMUL + T_WB)   # 串行 (无并行)
-            serial_cycle += serial * M
-            total_cim_cycle += cyc
-            if idx < 3 or diff != 0:
-                print(f"  [idx={idx:2d}] {name} N={N} K={K}: M=1,3 diff={diff}, "
-                      f"单token cycle={cyc // M}, 串行={serial}, 并行度={serial / (cyc / M):.2f}x "
-                      f"{'OK' if diff == 0 else 'FAIL'}", file=sys.stderr)
-    speedup = serial_cycle / total_cim_cycle if total_cim_cycle else 0
-    print(f"[Hw] {n} 次 driver_launch (37 BitLinear × M=1,3), max_diff={max_diff}", file=sys.stderr)
-    print(f"[Hw] 时序: 总 cim_cycle={total_cim_cycle}, 串行估算={serial_cycle}, "
-          f"整体并行度={speedup:.2f}x {'PASS ✓' if max_diff == 0 else 'FAIL ✗'}", file=sys.stderr)
-    return max_diff
-
-
-if __name__ == "__main__":
-    sys.exit(0 if _self_test() == 0 else 1)

@@ -42,7 +42,7 @@ def main():
     p.add_argument("--ffn_dim", type=int, default=1664)
     p.add_argument("--T", type=int, default=8, help="JIT 验证 seq len")
     p.add_argument("--no-sim", action="store_true", help="跳过 --sim (用 cim_stub CPU fallback)")
-    p.add_argument("--start-step", type=int, default=1, help="从第几步开始 (1-8, 调试用)")
+    p.add_argument("--start-step", type=int, default=1, help="从第几步开始 (1-9, 调试用)")
     args = p.parse_args()
     py = args.python
 
@@ -101,12 +101,20 @@ def main():
         "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
         "--n_kv_head", str(args.n_kv_head), "--ffn_dim", str(args.ffn_dim),
     ] + sim_flag))
+    # 9. AOT 构建: to_object + make -> cim_sim 可执行文件 (cim_compiler/lowering/aot/)
+    steps.append(("9. AOT 构建 (to_object + make -> cim_sim 可执行文件)", [
+        "make", "-C", "cim_compiler/lowering/aot"]))
 
     for i, (name, cmd) in enumerate(steps, 1):
         if i < args.start_step:
             print(f"[pipeline] === {name} === (跳过)", file=sys.stderr)
             continue
-        run(name, cmd, py)
+        if cmd[0] in ("make", "gcc"):   # 非 python 命令, 不加 py 前缀
+            print(f"\n[pipeline] === {name} ===", file=sys.stderr)
+            print(f"[pipeline] $ {' '.join(cmd)}", file=sys.stderr)
+            subprocess.run(cmd, check=True, cwd=REPO)
+        else:
+            run(name, cmd, py)
 
     print("\n[pipeline] ✓ 全流程完成 (任意规模自动适配, 硬件约束内)", file=sys.stderr)
 

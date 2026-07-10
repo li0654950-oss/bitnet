@@ -1,4 +1,12 @@
-# 系统级仿真运行时（CPU LLVM JIT + CIM hw_simulator）
+# 系统级仿真运行时（JIT 模式 + AOT 模式）
+
+两种模式（共用 `cim_stub.c` 不改 + `HwCimSimulator` 不改，差别在 CPU 侧执行方式 + 仿真器连接）：
+- **JIT 模式**（§0-5）：CPU 侧 LLVM JIT 进程内执行 + CIM 侧 ctypes 同进程回调。`cim_jit.py` / `run_sim_text.py`。
+- **AOT 模式**（§6）：CPU 侧独立可执行文件 `cim_sim` + CIM 侧 IPC（unix socket）跨进程。`cim_compiler/lowering/aot/`。
+
+---
+
+## JIT 模式
 
 把 cpu 侧（LLVM JIT）和 cim 侧（hw_simulator）串起来，看运行时一次前向推理（`invoker.invoke("main", *inputs)`）实际怎么走。
 
@@ -99,12 +107,12 @@ M = seq_len（动态）。CPU 一次传 M 个 token 的 x_int8，**C 侧 cim_lau
     reg_write(INT_CLEAR,1)  -> sim.mmio_reg_write: controller.int_clear()
     reg_read (IRQ_STATUS)   -> sim.mmio_reg_read :  return controller.irq_status (0/1/2/3)
     ═══════════════ CIM 侧硬件执行 (门铃异步 + cycle 取指) ═══════════════
-[hw_simulator · Controller.doorbell]  (hw_simulator.py:205-212)
+[hw_simulator · Controller.doorbell]  (hw_simulator.py:202-210)
     arbiter.reset()  (清 page_busy, 新指令段 PSUM_PAGE 独立)
     for m in macros: m.busy_until=0  (新指令段 Macro idle, 清前序残留; 不清 m.weight §4.6 两阶段)
     irq_status = BUSY
     Thread(_run, addr).start()  ← 异步, CPU 端 poll IRQ_STATUS
-[hw_simulator · Controller._run]  (cycle 级取指, hw_simulator.py:214-243)
+[hw_simulator · Controller._run]  (cycle 级取指, hw_simulator.py:211-241)
     cycle = 0
     while True:
         w = cache.read_instr(addr); addr+=6; cycle += T_FETCH           §3 取指
@@ -198,3 +206,94 @@ cycle 参数（§3 无规定，估算）：`T_FETCH=1, T_DISPATCH=2, T_PROG_WGT=
 - **Preload 一次性**：`cim_preload_init` 在 invoke main 之前调用一次，3664 Macro 权重永久驻留；doorbell 只清 busy_until/page_busy 不清 weight（§4.6 两阶段）。
 
 一次前向 = 37 次 CPU->CIM->CPU 闭环（6 层 × 6 BitLinear/qkvofc1fc2 + lm_head），中间穿插 CPU attention/act/残差/norm。CIM 侧 Preload 一次（3664 Macro 驻留），Forward 每次闭环走"写指令区 + A_PAGE -> 门铃 -> 取指 MATMUL(cycle 级) -> poll IRQ -> 读 acc -> INT_CLEAR"MMIO 协议。
+
+---
+
+## 6. AOT 模式（CPU 可执行文件 + IPC 仿真器）
+
+JIT 模式的演进：CPU 侧从 LLVM JIT 进程内执行 -> **AOT 独立可执行文件**，CIM 侧从 ctypes 同进程回调 -> **IPC（unix socket）跨进程**。模拟真实 CPU<->硬件分离（CPU 主动驱动，硬件被动响应，经 MMIO 协议）。
+
+### 6.1 架构（`cim_compiler/lowering/aot/`）
+
+```
+cim_sim (ELF 可执行文件) = 链接:
+  模型 .o  (to_object.py dump + objcopy --redefine-sym main=forward_entry)
+    ├ _mlir_ciface_main  (50 UnrankedMemRefDescriptor*, refbackend C 入口, emit_c_interface)
+    ├ forward_entry      (内部 main, 100 参数 {rank,descriptor}×50, objcopy 改名避冲突)
+    └ @cim_launch / @refbackend_consume_func_return_* external declare
+  cim_stub.o   (cim_launch + register_cim_hw_sim + cim_load_forward + cim_preload_init, 不改)
+  cim_runtime.o (C 版 _mlir_ciface_consume + unranked memref 构造工具, 对齐 torch_mlir runtime ABI)
+  cim_ipc.o    (IPC client: shm_* memcpy 共享内存 + reg_* socket, cim_ipc_init register)
+  cim_shm.o    (POSIX 共享内存抽象: shm_open/ftruncate/mmap, C/Python 共享 1MB)
+  cim_main.o   (main 入口: ipc_init + load_forward + preload_init + generate 循环 + tokenizer)
+
+cim_sim_server.py (Python, 独立进程, 循环 accept 持久服务):
+  HwCimSimulator (cache.data backed by SharedMemory) + SharedMemory("cim_cache") + unix socket
+  reg_* handler -> sim.mmio_reg_write/read (shm_* 不经 socket, C 直接写共享内存)
+```
+
+### 6.2 启动
+```
+终端1: python cim_compiler/lowering/aot/cim_sim_server.py        # 仿真器 server (先启动)
+终端2: ./cim_compiler/lowering/aot/cim_sim --prompt "ROMEO:" --n 60  # AOT 可执行文件
+一键:  ./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60  # nohup server + cim_sim + kill
+构建:  make -C cim_compiler/lowering/aot                            # 全量构建 cim_sim
+```
+
+### 6.3 数据流
+```
+cim_main: cim_ipc_init (连 server + register_cim_hw_sim IPC 回调 -> HW_READY=1)
+        -> cim_load_forward (CPU 本地读 forward.bin, 建 idx->段表)
+        -> cim_preload_init (经 IPC 驱动 server Preload, 3664 Macro 权重驻留)
+        -> generate 循环 (greedy, 对齐 run_sim_text):
+             构造 50 memref (49 buffer 复用 + idx 每步重建) -> _mlir_ciface_main
+             -> forward_entry -> cim_launch(idx, X, W) [W 空壳, cim_launch 不读, 用 idx 查 forward.bin]
+             -> cim_stub MMIO 回调 (shm_write A_PAGE/指令 + shm_read PSUM 走共享内存零往返; reg_write 门铃 + reg_read poll 走 socket)
+             -> 共享内存 (shm_*) + socket (reg_*) -> server HwCimSimulator (MATMUL cycle 级)
+             -> _mlir_ciface_consume 收 logits (rank=3 [1,seq,65]) -> argmax(logits[0,last,:]) -> append
+        -> decode (itos) 输出文本
+```
+
+### 6.4 IPC 协议（共享内存 shm 数据 + unix socket reg 控制）
+
+shm_*（数据传输，大块高频）：C/Python 共享 1MB POSIX 共享内存（`/dev/shm/cim_cache`，承载 CIM 共享缓存 `SharedCache.data`），C 直接 `memcpy` 读写（零拷贝零往返，替代 socket）。
+reg_*（控制信号，少量）：走 unix socket（作同步点，保证可见性）：
+```
+reg_write: req [op=3|reg(8)|val(8)] -> resp [ack(1)]
+reg_read:  req [op=4|reg(8)]        -> resp [val(4)]
+```
+同步语义：C 写 shm -> `reg_write(DOORBELL)` socket -> Python 读（socket 往返保证 C 写可见）；Python 写 PSUM -> `irq=DONE` socket -> C `shm_read`（DONE 同步保证 PSUM 可见）。
+
+共享内存：C `shm_open("/cim_cache")` == Python `SharedMemory("cim_cache")`。server 创建（`create=True`），cim_sim 打开。`SharedCache.data = np.frombuffer(shm.buf)` backed by 共享内存，所有 `read_bytes`/`rmw_int32` 方法不变。
+
+**cim_stub.c 不改**：`register_cim_hw_sim` 注册 4 回调（shm 走共享内存，reg 走 socket），机制天然支持换回调源。
+
+### 6.5 关键技术点
+- **AOT 编译**：`to_object.py` dump `.o`（`shared_libs=[cim_stub.so, cim_runtime.so]` 提供 consume 符号 resolved）+ `objcopy --redefine-sym main=forward_entry`（避免与 cim_main 的 main 冲突）。
+- **consume C ABI**：main 调 `@refbackend_consume_func_return_mrf32(rank, descriptor)` [wrapper, .o 内部] -> `_mlir_ciface_refbackend_consume_func_return_mrf32(sp)` [宿主提供, cim_runtime.o]。`sp` 指向 `{i64 rank, void* descriptor}`，descriptor -> ranked buffer `{allocated, aligned, offset, shape[rank], strides[rank]}`。
+- **C 入口**：`_mlir_ciface_main(50 UnrankedMemRefDescriptor*)`，每个参数指向 `{rank, descriptor}` struct（ciface body load + extractvalue 拆开传内部 main）。C main 传 `&desc[i]`。
+- **w_packed 空壳**：cim_launch(idx,X,W) 不读 W 数据（Preload 已驻留 Macro，Forward 用 idx 查 forward.bin + Macro 权重），W memref 仅 shape 对（N,K/4）即可，数据零。省去 C 侧加载 37 个权重。
+- **无 KV cache**：`_LogitsOnly.forward(idx)` 无状态（embed->layers->ln_f->lm_head），每步重算（O(n²)），C main 无状态机。对齐 run_sim_text。
+- **CharTokenizer C 化**：`tokenizer_data.h`（itos[65] + stoi[128]）从 `bitnet/data_char.py` meta 导出，C main encode/decode。
+
+### 6.6 与 JIT 模式对比
+| | JIT 模式 (§0-5) | AOT 模式 (§6) |
+|---|---|---|
+| CPU 侧 | ExecutionEngine JIT 进程内 | 独立 ELF 可执行文件 |
+| 仿真器连接 | ctypes 同进程回调 | IPC unix socket 跨进程 |
+| consume | Python ctypes 回调 | C 版 `_mlir_ciface_consume` |
+| 输入构造 | Python `build_inputs` | C main 构造 memref |
+| 生成循环 | Python `generate` | C main `generate` |
+| cim_stub.c | 不改 | 不改 |
+| HwCimSimulator | 不改 | 不改 |
+
+### 6.7 验证
+- **单步 forward**：cim_sim logits 与 Python 参考模型 `model(idx)` max_diff=0（`[4.0113, 1.6103, -6.1351, -8.0173, -7.4788]` 完全一致）。
+- **文本生成**：cim_sim `--prompt R --n 3` 输出 `RD I` 与 `run_sim_text.py` (JIT) 完全一致；`--prompt ROMEO: --n 8` 输出 `ROMEO:\n` 一致。
+- **server 统计**：n=3 共 12010 MMIO，cim_cycle=100。
+
+### 6.8 性能
+- **socket 模式**（早期）：每条 MMIO（shm+reg）一次 socket 往返，n=3 ~1.5s / 12010 MMIO。
+- **共享内存模式**（当前）：shm_* 走共享内存零往返，仅 reg_* 走 socket。n=3 ~0.93s / 3307 reg-socket（消除 ~8700 shm 往返，**快 ~40%**）。
+- 剩余开销：reg_* socket 往返（`reg_read` poll IRQ 高频）。阶段 2 优化方向：irq_status 放共享内存控制区 + doorbell 用 eventfd（poll 零往返）。
+- generate O(n²) 累积，大批量仍慢。

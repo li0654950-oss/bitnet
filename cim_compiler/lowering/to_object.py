@@ -46,6 +46,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--in", dest="inp", default="checkpoints/bitnet_ternary_placeholder.mlir")
     p.add_argument("--so", default=os.path.join(HERE, "cim_stub.so"))
+    p.add_argument("--runtime-so", default=os.path.join(HERE, "aot", "cim_runtime.so"),
+                   help="C 版 consume runtime (.so, 提供 refbackend_consume_func_return_*, AOT 用)")
     p.add_argument("--out", default="checkpoints/bitnet_ternary.o")
     args = p.parse_args()
 
@@ -66,18 +68,9 @@ def main():
     mod.operation.verify()
 
     print(f"[L7] LLVM mod OK, JIT 编译 + dump object...", file=sys.stderr)
-    ee = ExecutionEngine(mod, shared_libs=[args.so], enable_pic=True)
-    # 注册 refbackend_consume_func_return_* 占位 (dump 要求 symbol resolved)
-    for f in mod.body:
-        nm_attr = f.attributes.get("sym_name")
-        if nm_attr is None:
-            continue
-        nm = str(nm_attr).strip('"')
-        if nm.startswith(CONSUME_PREFIX):
-            ret_types = nm[len(CONSUME_PREFIX):].split("_")
-            ctypes_arg = [None] + [ELEMENTAL.get(t, ctypes.POINTER(UnrankedMemRefDescriptor)) for t in ret_types]
-            ctype = ctypes.CFUNCTYPE(*ctypes_arg)
-            ee.register_runtime(nm, ctype(lambda *a: None))
+    # consume 符号 (refbackend_consume_func_return_*) 由 cim_runtime.so C 版提供
+    # (dump_to_object_file 要求 external symbol resolved, shared_libs 满足; 替代 JIT 的 register_runtime)
+    ee = ExecutionEngine(mod, shared_libs=[args.so, args.runtime_so], enable_pic=True)
     ee.dump_to_object_file(args.out)
     print(f"[L7] saved: {args.out}", file=sys.stderr)
     ok = os.path.exists(args.out) and os.path.getsize(args.out) > 0
