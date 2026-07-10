@@ -13,8 +13,9 @@ pipeline -> LLVM IR), 用 ExecutionEngine JIT 执行 main:
 
 main 的 w_packed 是 i8 (MLIR 无 ui8), C stub 按 uint8 解释。
 
-方案 A (系统级仿真): cim_stub.c 的 cim_launch_<idx> 调 Python CIM 指令级仿真器
-  (register_cim_sim_callback), 走真实 func.call + JIT 链路, 与现有架构一致。
+方案 A (系统级仿真): cim_stub.c 的 cim_launch_<idx> + cim_preload_init 通过 MMIO 驱动
+  Python 纯硬件仿真器 (register_cim_hw_sim 注册 4 回调 shm/reg), 走真实 func.call + JIT 链路。
+  真实硬件: cim_stub.c #define HW_REAL, MMIO 直接 volatile, 无 Python (架构就绪)。
 """
 import os
 import sys
@@ -120,31 +121,44 @@ class CIMInvoker:
         return result
 
 
-# ---- 方案 A: CIM 指令级仿真器回调 (cim_stub.c cim_launch_<idx> -> Python) ----
-# 回调签名匹配 cim_stub.c: void(int idx, int8* x, int64 M, int64 K, uint8* w, int64 N, int64 K4, int32* out)
-_CIM_SIM_CB = ctypes.CFUNCTYPE(None, ctypes.c_int,
-                               ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                               ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
-                               ctypes.c_void_p)
+# ---- 方案 A: CIM 纯硬件仿真器 MMIO 回调 (cim_stub.c shm/reg -> hw_simulator) ----
+# cim_stub.c 的 shm_write/shm_read/reg_write/reg_read 经此转发 hw_simulator.mmio_*
+# (cim_launch_<idx> + cim_preload_init 通过 MMIO 驱动纯硬件, 硬件自己取指)
+_SHM_WRITE_CB = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64)
+_SHM_READ_CB = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64)
+_REG_WRITE_CB = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int64)
+_REG_READ_CB = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int64)
 
 
-def register_cim_sim_callback(so_path, sim):
-    """ctypes 加载 cim_stub.so, 注册 Python 回调 py_cim_sim -> sim.simulate。
-    cim_stub.c 的 cim_launch_<idx> 调此回调 (传 x/w 指针+idx), 回调写 result buffer。
-    返回 lib (持有回调引用, 调用方须保持存活)。"""
+def register_cim_hw_sim(so_path, sim):
+    """ctypes 加载 cim_stub.so, 注册 4 个 MMIO 回调 -> sim.mmio_*。
+    cim_stub.c 的 shm_write/shm_read/reg_write/reg_read 经此转发 hw_simulator (纯硬件)。
+    返回 lib (持回调引用, 调用方须保持存活, 防 GC 段错误)。"""
     lib = ctypes.CDLL(so_path)
 
-    @_CIM_SIM_CB
-    def py_cim_sim(idx, x_ptr, M, K, w_ptr, N, K4, out_ptr):
-        # 从 C 指针读 x[M,K] int8 + w[N,K4] uint8 (main 的 w_packed, i8->uint8)
-        x = np.ctypeslib.as_array(ctypes.cast(x_ptr, ctypes.POINTER(ctypes.c_int8)), (M, K))
-        w = np.ctypeslib.as_array(ctypes.cast(w_ptr, ctypes.POINTER(ctypes.c_uint8)), (N, K4))
-        acc = sim.simulate(idx, x, w)                       # [M,N] int32 (指令级, idx->Macro)
-        out = np.ctypeslib.as_array(ctypes.cast(out_ptr, ctypes.POINTER(ctypes.c_int32)), (M, N))
-        out[:] = acc                                        # 写回 C malloc 的 result buffer
+    @_SHM_WRITE_CB
+    def cb_shm_write(addr, ptr, n):
+        sim.mmio_shm_write(addr, ptr, n)
 
-    lib.register_cim_simulator(py_cim_sim)
-    lib._py_cim_sim = py_cim_sim                            # 保持回调对象存活 (防 GC)
+    @_SHM_READ_CB
+    def cb_shm_read(addr, ptr, n):
+        sim.mmio_shm_read(addr, ptr, n)
+
+    @_REG_WRITE_CB
+    def cb_reg_write(reg, val):
+        sim.mmio_reg_write(reg, val)
+
+    @_REG_READ_CB
+    def cb_reg_read(reg):
+        return sim.mmio_reg_read(reg)
+
+    lib.register_cim_hw_sim(cb_shm_write, cb_shm_read, cb_reg_write, cb_reg_read)
+    lib._cbs = (cb_shm_write, cb_shm_read, cb_reg_write, cb_reg_read)  # 持引用防 GC
+    # forward.bin (按 idx 索引) + preload.bin (自包含) 加载到 cim_stub
+    lib.cim_load_forward.argtypes = [ctypes.c_char_p]
+    lib.cim_load_forward.restype = None
+    lib.cim_preload_init.argtypes = [ctypes.c_char_p]
+    lib.cim_preload_init.restype = None
     return lib
 
 
@@ -189,15 +203,14 @@ def main():
     sim_lib = None
     if args.sim:
         from cim_compiler.cimres.hw_simulator import HwCimSimulator
-        sim = HwCimSimulator(
-            os.path.join(REPO, "cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir"),
-            os.path.join(REPO, "checkpoints/bitnet_ternary_weights.bin"),
-            os.path.join(REPO, "checkpoints/bitnet_ternary_partition.json"),
-        )
-        sim.preload_phase()  # Preload Phase: PROG_WGT 取指预载 Macro (硬件级)
-        sim_lib = register_cim_sim_callback(args.so, sim)
-        print(f"[L6] 硬件级 CIM 仿真器回调已注册 (方案 A, preload_phase {len(sim.macros.macro)} Macro)",
-              file=sys.stderr)
+        sim = HwCimSimulator()                       # 纯硬件 (无参数, 不读 IR/weights)
+        sim_lib = register_cim_hw_sim(args.so, sim)  # 注册 4 个 MMIO 回调
+        fwd = os.path.join(REPO, "cim_compiler/cimres/checkpoints/forward.bin")
+        pre = os.path.join(REPO, "cim_compiler/cimres/checkpoints/preload.bin")
+        sim_lib.cim_load_forward(fwd.encode())       # forward.bin 按 idx 索引 (cim_launch 查)
+        sim_lib.cim_preload_init(pre.encode())       # Preload: 读 preload.bin MMIO 驱动 (一次性)
+        print(f"[L6] 纯硬件 CIM 仿真器 MMIO 回调已注册 + cim_preload_init "
+              f"({len(sim.macros.macro)} Macro 预载)", file=sys.stderr)
 
     from inference_model import build_inference_model
     model = build_inference_model(args.ternary, vocab_size=65)
@@ -213,7 +226,7 @@ def main():
     diff = np.abs(logits.astype(np.float64) - ref.astype(np.float64))
     print(f"[L6] max abs diff = {diff.max():.4f}, mean = {diff.mean():.4f}", file=sys.stderr)
     ok = diff.max() < 1.0
-    mode = "方案A CIM 指令级仿真器" if args.sim else "cim_stub CPU 算 fallback"
+    mode = "方案A 纯硬件 MMIO 仿真器" if args.sim else "cim_stub CPU 算 fallback"
     print(f"\n[L6] {'PASS ✓ (' + mode + ', func.call 正确接入)' if ok else 'FAIL ✗'}",
           file=sys.stderr)
     sys.exit(0 if ok else 1)

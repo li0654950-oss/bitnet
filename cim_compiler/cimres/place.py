@@ -6,8 +6,10 @@
                  (每 k_slice 64 int8 = 64B; 每 BitLinear 复用, Forward 期串行不冲突)
   psum_page    : 累加区 (0xC00+), psum_page = 0xC00 + n_blk
                  (每 n_blk 1 PAGE = 64 int32 = 256B; K 维多 tile RMW 累加同 PAGE)
-  b_page_start : Preload 区 (覆盖区 0x000~0xBEF, 分 5 批每批 764 tile)
-                 b_page_start = (dest_id % 764) * 4  (每 tile 2bit = 1024B = 4 PAGE, 批内复用)
+  b_page_start : Preload 区 (覆盖区 0x000~0xBEF, 分批每批 681 tile)
+                 b_page_start = (dest_id % 681) * 4  (每 tile 2bit = 1024B = 4 PAGE, 批内复用)
+                 (批大小受指令区容量约束: 4KB/6B=682 条 48-bit, 留 1 SYNC_HALT -> 681;
+                  §4.6 的 764 是覆盖区约束, 与指令区 682 矛盾, 取保守 681)
 
 dest_id (Macro 分配) C1 已全局分配 (0~3663), C2 确认 < 4096 Macro (§4.5)。
 累加区 RMW 串行模型: C1 调度外层 k 串行保证同 PSUM_PAGE 不并行 (§4.7.7)。
@@ -34,7 +36,7 @@ from cim_compiler.cimres.dialect import register_cimres, i32_attr
 
 A_PAGE_BASE = 0x010       # Forward 输入区 (覆盖区, int8 特征)
 PSUM_PAGE_BASE = 0xC00    # 部分和累加区 (int32, 256B/PAGE = 64 int32)
-PRELOAD_BATCH = 764       # 每批 764 tile (764×4 PAGE = 3056 = 0x000~0xBEF, §4.6)
+PRELOAD_BATCH = 681       # 每批 681 tile (指令区 4KB/6B=682 条, 留 1 SYNC_HALT; 闭合 §4.6 764 与指令区矛盾)
 
 
 def place(cimres_in, out_path):
@@ -70,7 +72,7 @@ def place(cimres_in, out_path):
               f"max dest_id={max_dest} (< 4096: {'OK' if max_dest < 4096 else 'OVER'})",
               file=sys.stderr)
         print(f"[C2] A_PAGE=0x{A_PAGE_BASE:x}+k_blk, PSUM_PAGE=0x{PSUM_PAGE_BASE:x}+n_blk, "
-              f"b_page=(dest%764)*4", file=sys.stderr)
+              f"b_page=(dest%{PRELOAD_BATCH})*4", file=sys.stderr)
         print(f"[C2] saved: {out_path}", file=sys.stderr)
     return mod
 

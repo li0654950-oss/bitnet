@@ -104,17 +104,17 @@ def main():
     invoker = cim_jit.CIMInvoker(mod, args.so)
     print("[gen] ExecutionEngine + cim_stub.so 就绪", file=sys.stderr)
 
+    sim_lib = None
     if args.sim:
         from cim_compiler.cimres.hw_simulator import HwCimSimulator
-        sim = HwCimSimulator(
-            os.path.join(REPO, "cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir"),
-            os.path.join(REPO, "checkpoints/bitnet_ternary_weights.bin"),
-            os.path.join(REPO, "checkpoints/bitnet_ternary_partition.json"),
-        )
-        sim.preload_phase()  # Preload Phase: PROG_WGT 取指预载 Macro (硬件级)
-        sim_lib = cim_jit.register_cim_sim_callback(args.so, sim)  # 须保存 (持回调引用防 GC 段错误)
-        print(f"[gen] 硬件级 CIM 仿真器回调已注册 (方案 A, preload_phase {len(sim.macros.macro)} Macro)",
-              file=sys.stderr)
+        sim = HwCimSimulator()                       # 纯硬件 (无参数)
+        sim_lib = cim_jit.register_cim_hw_sim(args.so, sim)  # 须保存 (持回调引用防 GC 段错误)
+        fwd = os.path.join(REPO, "cim_compiler/cimres/checkpoints/forward.bin")
+        pre = os.path.join(REPO, "cim_compiler/cimres/checkpoints/preload.bin")
+        sim_lib.cim_load_forward(fwd.encode())       # forward.bin 按 idx 索引
+        sim_lib.cim_preload_init(pre.encode())       # Preload: 读 preload.bin MMIO 驱动 (一次性)
+        print(f"[gen] 纯硬件 CIM 仿真器 MMIO 回调已注册 + cim_preload_init "
+              f"({len(sim.macros.macro)} Macro 预载)", file=sys.stderr)
 
     from inference_model import build_inference_model
     model = build_inference_model(args.ternary, vocab_size=65)
