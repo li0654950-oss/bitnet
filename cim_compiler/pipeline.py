@@ -101,8 +101,10 @@ def main():
         "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
         "--n_kv_head", str(args.n_kv_head), "--ffn_dim", str(args.ffn_dim),
     ] + sim_flag))
-    # 9. AOT 构建: to_object + make -> cim_sim 可执行文件 (cim_compiler/lowering/aot/)
-    steps.append(("9. AOT 构建 (to_object + make -> cim_sim 可执行文件)", [
+    # 9. AOT 构建: to_object + make -> cim_sim + model_config.bin (cim_compiler/lowering/aot/)
+    #    make 依赖链自动: gen_config (.pt2 -> model_config.bin) + 链接 cim_sim (-lffi 运行时变参)
+    #    cim_main.c 固定通用宿主, 任意模型规模复用 (超参运行时从 model_config.bin 读)
+    steps.append(("9. AOT 构建 (to_object + make -> cim_sim + model_config.bin)", [
         "make", "-C", "cim_compiler/lowering/aot"]))
 
     for i, (name, cmd) in enumerate(steps, 1):
