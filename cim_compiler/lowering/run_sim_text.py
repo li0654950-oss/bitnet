@@ -68,26 +68,33 @@ def main():
     p.add_argument("--ternary", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
     p.add_argument("--so", default=os.path.join(HERE, "cim_stub.so"))
     p.add_argument("--prompt", default="ROMEO:", help="起始文本 (须为 vocab 内字符)")
+    p.add_argument("--prompt-int", dest="prompt_int", type=int, default=None,
+                   help="int prompt 模式 (跳过 tokenizer, 直接用 token id; 合并自 generate.py)")
     p.add_argument("--num-tokens", dest="n", type=int, default=60, help="生成 token 数")
     p.add_argument("--block_size", type=int, default=256)
     p.add_argument("--sim", action="store_true", default=True, help="用 hw_simulator MMIO 仿真")
     p.add_argument("--no-ref", action="store_true", help="跳过 PyTorch reference")
     args = p.parse_args()
 
-    # ---- tokenizer ----
-    from bitnet.data_char import CharTokenizer
-    tok = CharTokenizer()
-    vocab = tok.itos
-    bad = [c for c in args.prompt if c not in tok.stoi]
-    if bad:
-        print(f"[err] prompt 含 vocab 外字符: {bad}", file=sys.stderr)
-        print(f"      vocab={sorted(vocab.values())}", file=sys.stderr)
-        sys.exit(1)
-    prompt_ids = tok.encode(args.prompt)
-    if not prompt_ids:
-        prompt_ids = [0]  # BOS
-    idx0 = torch.tensor([prompt_ids], dtype=torch.long)
-    print(f"[prompt] {args.prompt!r} -> {len(prompt_ids)} token: {prompt_ids}", file=sys.stderr)
+    # ---- tokenizer (文本 prompt) 或 int prompt (合并自 generate.py) ----
+    tok = None
+    if args.prompt_int is not None:
+        idx0 = torch.tensor([[args.prompt_int]], dtype=torch.long)
+        print(f"[prompt] int mode: token id = {args.prompt_int}", file=sys.stderr)
+    else:
+        from bitnet.data_char import CharTokenizer
+        tok = CharTokenizer()
+        vocab = tok.itos
+        bad = [c for c in args.prompt if c not in tok.stoi]
+        if bad:
+            print(f"[err] prompt 含 vocab 外字符: {bad}", file=sys.stderr)
+            print(f"      vocab={sorted(vocab.values())}", file=sys.stderr)
+            sys.exit(1)
+        prompt_ids = tok.encode(args.prompt)
+        if not prompt_ids:
+            prompt_ids = [0]  # BOS
+        idx0 = torch.tensor([prompt_ids], dtype=torch.long)
+        print(f"[prompt] {args.prompt!r} -> {len(prompt_ids)} token: {prompt_ids}", file=sys.stderr)
 
     # ---- 构建 JIT + 仿真器 ----
     cim_jit = _load_cim_jit()
@@ -121,20 +128,28 @@ def main():
         print("[run] PyTorch reference 生成...", file=sys.stderr)
         ref_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=True)
 
-    # ---- 输出文本 ----
-    jit_text = tok.decode(jit_tokens)
+    # ---- 输出 (int 模式: token 列表; 文本模式: decode 文本) ----
     print("\n" + "=" * 60, file=sys.stderr)
-    print(f"prompt  : {args.prompt!r}")
-    print(f"JIT 仿真输出 ({len(jit_tokens)} token):")
-    print(jit_text)
-    if ref_tokens is not None:
-        ref_text = tok.decode(ref_tokens)
-        match = jit_tokens == ref_tokens
-        print("-" * 60)
-        print(f"PyTorch ref 输出:")
-        print(ref_text)
-        print("-" * 60)
-        print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
+    if args.prompt_int is not None:
+        print(f"prompt  : token id = {args.prompt_int}")
+        print(f"JIT 仿真输出 ({len(jit_tokens)} token): {jit_tokens}")
+        if ref_tokens is not None:
+            match = jit_tokens == ref_tokens
+            print(f"PyTorch ref 输出: {ref_tokens}")
+            print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
+    else:
+        jit_text = tok.decode(jit_tokens)
+        print(f"prompt  : {args.prompt!r}")
+        print(f"JIT 仿真输出 ({len(jit_tokens)} token):")
+        print(jit_text)
+        if ref_tokens is not None:
+            ref_text = tok.decode(ref_tokens)
+            match = jit_tokens == ref_tokens
+            print("-" * 60)
+            print(f"PyTorch ref 输出:")
+            print(ref_text)
+            print("-" * 60)
+            print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
     print("=" * 60, file=sys.stderr)
 
 

@@ -8,8 +8,8 @@
   lower_to_cimres : C1 逻辑 tile 展开 (cim.matmul -> macro_matmul tile 序列)
   place           : C2 资源映射 (Macro Dest_ID + PAGE 布局)
   emit_instr      : C3 48-bit 指令编码 (cimres -> MACRO_PROG_WGT/MATMUL/SYNC_HALT)
-  simulator       : C4 CIM 指令流模拟器 (取指执行 + 对齐 PyTorch 参考)
-  runtime         : C5 运行时动态 M 驱动
+  hw_simulator    : CIM 纯硬件仿真器 (cycle 级时序 + MMIO, cim_stub.c 驱动)
+  (运行时动态 M 由 cim_stub.c M 循环承担, 方案 C, seq_len 运行时吸收)
 """
 from .dialect import (
     CIMRES_IRDL, register_cimres,

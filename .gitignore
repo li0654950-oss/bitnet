@@ -8,3 +8,7 @@ wandb/
 data/model.safetensors
 checkpoints/
 .claude/
+# 构建产物 (make/gcc 可重建)
+*.o
+*.so
+*.bin

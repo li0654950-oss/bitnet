@@ -3,7 +3,7 @@
 
 在硬件约束内 (<=4096 Macro), 给定 ternary.pt + 模型配置, 一条命令跑通:
   export_fx -> L0 to_mlir -> partition -> C1 lower_to_cimres -> C2 place -> C3 emit_instr
-  -> L1 cim_lowering -> gen_cim_stub -> cim_jit --sim (max_diff=0 验证)
+  -> L1 cim_lowering -> cim_jit --sim (max_diff=0 验证)
 
 任意规模 (n_layer/d_model/n_head/n_kv_head/ffn_dim) 自动适配, 无需手改代码。
 
