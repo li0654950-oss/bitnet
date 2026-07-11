@@ -42,7 +42,7 @@ def main():
     p.add_argument("--ffn_dim", type=int, default=1664)
     p.add_argument("--T", type=int, default=8, help="JIT 验证 seq len")
     p.add_argument("--no-sim", action="store_true", help="跳过 --sim (用 cim_stub CPU fallback)")
-    p.add_argument("--start-step", type=int, default=1, help="从第几步开始 (1-9, 调试用)")
+    p.add_argument("--start-step", type=int, default=1, help="从第几步开始 (1-12, 调试用)")
     args = p.parse_args()
     py = args.python
 
@@ -81,18 +81,27 @@ def main():
     steps.append(("4. C1 lower_to_cimres (partition+weights -> cimres IR)", [
         "cim_compiler/cimres/lower_to_cimres.py",
         "--partition", partition, "--weights", weights, "--out", cimres]))
-    # 5. C2 place: cimres.mlir -> placed.mlir (容量校验 <=4096 Macro)
-    steps.append(("5. C2 place (cimres -> placed, 容量校验)", [
+    # 5. cimres passes: canonicalize + cse (S0, 逻辑层冗余消除, 框架就位)
+    steps.append(("5. cimres passes (canon+cse, S0 逻辑层)", [
+        "cim_compiler/cimres/run_passes.py", "--in", cimres]))
+    # 6. C2 place: cimres.mlir -> placed.mlir (容量校验 <=4096 Macro)
+    steps.append(("6. C2 place (cimres -> placed, 容量校验)", [
         "cim_compiler/cimres/place.py", "--in", cimres, "--out", placed]))
-    # 6. C3 emit_instr: placed.mlir + weights.bin -> forward.bin + preload.bin (容量校验)
-    steps.append(("6. C3 emit_instr (placed+weights -> forward/preload, 容量校验)", [
+    # 7. verify: placed.mlir 结构校验 (S0 安全网, dest_id/accum/PAGE 冲突, gate 失败中止)
+    steps.append(("7. verify (placed 结构校验, S0 安全网 gate)", [
+        "cim_compiler/cimres/verify.py", "--in", placed]))
+    # 8. 调度分析: cost_model + scheduler + page_alloc (S1, makespan/最优性/PAGE 报告, 不改产物)
+    steps.append(("8. 调度分析 (cost_model+scheduler+page_alloc, S1)", [
+        "cim_compiler/cimres/run_sched_analysis.py", "--in", placed]))
+    # 9. C3 emit_instr: placed.mlir + weights.bin -> forward.bin + preload.bin (容量校验)
+    steps.append(("9. C3 emit_instr (placed+weights -> forward/preload, 容量校验)", [
         "cim_compiler/cimres/emit_instr.py"]))
-    # 7. L1 cim_lowering: bitnet_ternary.mlir -> placeholder.mlir
-    steps.append(("7. L1 cim_lowering (mlir -> placeholder)", [
+    # 10. L1 cim_lowering: bitnet_ternary.mlir -> placeholder.mlir
+    steps.append(("10. L1 cim_lowering (mlir -> placeholder)", [
         "cim_compiler/lowering/cim_lowering.py", "--in", mlir0, "--out", placeholder]))
-    # 8. cim_jit --sim: JIT + 数值验证 (max_diff=0)  [A1] .so 固定, 不再 gen_cim_stub
+    # 11. cim_jit --sim: JIT + 数值验证 (max_diff=0)  [A1] .so 固定, 不再 gen_cim_stub
     sim_flag = [] if args.no_sim else ["--sim"]
-    steps.append(("8. cim_jit (JIT + 数值验证)", [
+    steps.append(("11. cim_jit (JIT + 数值验证)", [
         "cim_compiler/lowering/cim_jit.py",
         "--in", placeholder, "--ternary", args.ternary, "--so", so,
         "--T", str(args.T),
@@ -101,10 +110,10 @@ def main():
         "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
         "--n_kv_head", str(args.n_kv_head), "--ffn_dim", str(args.ffn_dim),
     ] + sim_flag))
-    # 9. AOT 构建: to_object + make -> cim_sim + model_config.bin (cim_compiler/lowering/aot/)
+    # 12. AOT 构建: to_object + make -> cim_sim + model_config.bin (cim_compiler/lowering/aot/)
     #    make 依赖链自动: gen_config (.pt2 -> model_config.bin) + 链接 cim_sim (-lffi 运行时变参)
     #    cim_main.c 固定通用宿主, 任意模型规模复用 (超参运行时从 model_config.bin 读)
-    steps.append(("9. AOT 构建 (to_object + make -> cim_sim + model_config.bin)", [
+    steps.append(("12. AOT 构建 (to_object + make -> cim_sim + model_config.bin)", [
         "make", "-C", "cim_compiler/lowering/aot"]))
 
     for i, (name, cmd) in enumerate(steps, 1):
