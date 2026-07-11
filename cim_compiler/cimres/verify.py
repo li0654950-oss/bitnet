@@ -38,6 +38,34 @@ def verify(mod) -> list:
     preload_dests = _preload_dest_set(mod)
     for func_op, _ in func_blocks(mod):
         issues += _check_func(func_op, preload_dests)
+    issues += _check_double_buffer_layout(mod)
+    return issues
+
+
+def _check_double_buffer_layout(mod):
+    """S2: double buffer bank0/bank1 PAGE 布局不冲突 (基于 IR max k/n tiles)。
+
+    bank0: [A_PAGE_BASE, +max_k), bank1: [A_PAGE_BANK1_BASE, +max_k)。
+    检查 bank0/bank1 不重叠, bank1 不越界指令区。PSUM 同理。
+    """
+    from cim_compiler.cimres.hw_config import (
+        A_PAGE_BASE, A_PAGE_BANK1_BASE, PSUM_PAGE_BASE, PSUM_BANK1_BASE, INSTR_BASE)
+    issues = []
+    max_k = max_n = 0
+    for func_op, _ in func_blocks(mod):
+        for m in matmuls_in_func(func_op):
+            max_k = max(max_k, m["k_blk"] + 1)
+            max_n = max(max_n, m["n_blk"] + 1)
+    if max_k == 0:
+        return issues
+    if A_PAGE_BASE + max_k > A_PAGE_BANK1_BASE:
+        issues.append(f"A_PAGE bank0 [0x{A_PAGE_BASE:x},0x{A_PAGE_BASE + max_k:x}) 与 bank1 "
+                      f"0x{A_PAGE_BANK1_BASE:x} 重叠 (max k_tiles={max_k})")
+    if A_PAGE_BANK1_BASE + max_k > INSTR_BASE:
+        issues.append(f"A_PAGE bank1 越界指令区 0x{INSTR_BASE:x} (max k_tiles={max_k})")
+    if PSUM_PAGE_BASE + max_n > PSUM_BANK1_BASE:
+        issues.append(f"PSUM bank0 [0x{PSUM_PAGE_BASE:x},0x{PSUM_PAGE_BASE + max_n:x}) 与 bank1 "
+                      f"0x{PSUM_BANK1_BASE:x} 重叠 (max n_tiles={max_n})")
     return issues
 
 

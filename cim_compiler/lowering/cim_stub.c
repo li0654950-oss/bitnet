@@ -84,11 +84,13 @@ static inline uint32_t reg_read(long reg) {
 #define HW_READY (g_shm_write_cb != NULL)
 
 /* ===== forward.bin idx 索引 (运行时加载, C3 产出, 按 idx 索引) ===== */
-static uint8_t *g_fwd_buf = NULL;       /* 整个 forward.bin */
-static uint8_t *g_fwd_base = NULL;      /* 段数据起点 */
+static uint8_t *g_fwd_buf = NULL;       /* 整个 forward.bin (bank0 原段) */
+static uint8_t *g_fwd_base = NULL;      /* 段数据起点 (bank0) */
 static uint32_t g_fwd_nidx = 0;
 static uint32_t *g_fwd_off = NULL;
 static uint32_t *g_fwd_len = NULL;
+static uint8_t *g_fwd_buf2 = NULL;      /* S2: bank1 patch 段 (a_page/psum_page +bank off) */
+static uint8_t *g_fwd_base2 = NULL;     /* bank1 段数据起点 */
 
 void cim_load_forward(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -107,6 +109,26 @@ void cim_load_forward(const char *path) {
     memcpy(g_fwd_off, g_fwd_buf + 8, g_fwd_nidx * 4);
     memcpy(g_fwd_len, g_fwd_buf + 8 + g_fwd_nidx * 4, g_fwd_nidx * 4);
     g_fwd_base = g_fwd_buf + 8 + 2 * g_fwd_nidx * 4;
+    /* S2: 生成 bank1 patch 段 (a_page+=A_BANK_OFF, psum_page+=P_BANK_OFF), double buffer 流水用 */
+    g_fwd_buf2 = (uint8_t *)malloc(sz);
+    memcpy(g_fwd_buf2, g_fwd_buf, sz);
+    g_fwd_base2 = g_fwd_buf2 + 8 + 2 * g_fwd_nidx * 4;
+    for (uint32_t i = 0; i < g_fwd_nidx; i++) {
+        uint8_t *seg = g_fwd_base2 + g_fwd_off[i];
+        uint32_t nmm = g_fwd_len[i] / 6 - 1;   /* 减末尾 SYNC_HALT */
+        for (uint32_t j = 0; j < nmm; j++) {
+            uint8_t *p = seg + j * 6;
+            uint64_t word = 0;
+            for (int b = 0; b < 6; b++) word |= (uint64_t)p[b] << (b * 8);
+            if (((word >> 45) & 0x7) == OP_MATMUL) {
+                uint64_t page1 = ((word >> 21) & 0xFFF) + A_BANK_OFF;
+                uint64_t page2 = ((word >> 9) & 0xFFF) + P_BANK_OFF;
+                word = (word & ~((uint64_t)0xFFF << 21 | (uint64_t)0xFFF << 9))
+                       | (page1 << 21) | (page2 << 9);
+                for (int b = 0; b < 6; b++) p[b] = (uint8_t)((word >> (b * 8)) & 0xFF);
+            }
+        }
+    }
 }
 
 /* ===== Preload init (一次性, 读 preload.bin 自包含, §4.2/4.6) ===== */
@@ -196,29 +218,64 @@ Memref2D cim_launch(int64_t idx,
     int64_t n_mm = (int64_t)g_fwd_len[idx] / 6 - 1;  /* MATMUL 数 (减末尾 SYNC_HALT), idx 查 forward.bin */
     int64_t n_blk = (n_mm + SEG_MAX - 1) / SEG_MAX;  /* 块数 (1=不分块) */
     static const uint8_t HALT[6] = {0,0,0,0,0,0xE0};  /* SYNC_HALT word (0x7<<45 小端) */
-    for (int64_t m = 0; m < M; m++) {
-        /* 写 A_PAGE (按 k_blk 切, 每 64 int8) -- §4.7.3 */
+    if (n_blk == 1) {
+        /* S2 流水: double buffer A_PAGE/PSUM (bank0/bank1 ping-pong), 写A_PAGE(m+1)/读PSUM(m)
+           与 CIM 算 m/m+1 并行 (单 doorbell 顺序, §4.6 line341 CPU 可写非目标 PAGE)。
+           CIM 不 idle 等搬运, 利用率 56%->100%。bn=m%2 (PSUM bank), bn_next=(m+1)%2 (A_PAGE bank) */
+        /* prologue: 写 A_PAGE(0, bank0) + doorbell(0, bank0) */
         for (int64_t kb = 0; kb < k_tiles; kb++)
-            shm_write((long)(A_PAGE_BASE + kb) * PAGE,
-                      x + m * K + kb * TILE, TILE);
-        /* 分块门铃: 每块 ≤ 681 MATMUL + 末尾 SYNC_HALT (跨块 PSUM_PAGE 累加) */
-        int64_t mm_done = 0;
-        for (int64_t b = 0; b < n_blk; b++) {
-            int64_t blk_mm = (mm_done + SEG_MAX <= n_mm) ? SEG_MAX : (n_mm - mm_done);
-            shm_write((long)INSTR_BASE * PAGE,
-                      g_fwd_base + g_fwd_off[idx] + mm_done * 6, blk_mm * 6);
-            shm_write((long)INSTR_BASE * PAGE + blk_mm * 6, (const void *)HALT, 6);
-            reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
-            while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;  /* poll IRQ */
+            shm_write((long)(A_PAGE_BASE + kb) * PAGE, x + 0 * K + kb * TILE, TILE);
+        shm_write((long)INSTR_BASE * PAGE, g_fwd_base + g_fwd_off[idx], n_mm * 6);
+        shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
+        reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);   /* CIM 算 0 */
+        for (int64_t m = 0; m < M; m++) {
+            int64_t bn = m % 2, bn_next = (m + 1) % 2;
+            long a_base = A_PAGE_BASE + bn_next * A_BANK_OFF;     /* A_PAGE bank bn_next */
+            long p_base = PSUM_PAGE_BASE + bn * P_BANK_OFF;       /* PSUM bank bn (m 的) */
+            const uint8_t *seg_next = bn_next ? g_fwd_base2 : g_fwd_base;
+            /* 写 A_PAGE(m+1, bn_next) [CIM 算 m 并行, 不同 PAGE 不冲突] */
+            if (m + 1 < M)
+                for (int64_t kb = 0; kb < k_tiles; kb++)
+                    shm_write((a_base + kb) * PAGE, x + (m + 1) * K + kb * TILE, TILE);
+            /* poll(m): 等 CIM 算完 m */
+            while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;
             reg_write((long)INT_CLEAR_REG, 1);
-            mm_done += blk_mm;
+            /* doorbell(m+1, bn_next) [CIM 算 m+1 写 PSUM bn_next, 与读 PSUM m(bn) 不冲突] */
+            if (m + 1 < M) {
+                shm_write((long)INSTR_BASE * PAGE, seg_next + g_fwd_off[idx], n_mm * 6);
+                shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
+                reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+            }
+            /* 读 PSUM(m, bn) [CIM 算 m+1 并行, bn != bn_next 不冲突] */
+            for (int64_t nb = 0; nb < n_tiles; nb++) {
+                int32_t acc_buf[TILE];
+                shm_read((p_base + nb) * PAGE, acc_buf, PAGE);
+                int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
+                memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
+            }
         }
-        /* 读 PSUM_PAGE acc[m] (按 n_blk 拼, 取 valid 行) -- §4.7.5 */
-        for (int64_t nb = 0; nb < n_tiles; nb++) {
-            int32_t acc_buf[TILE];
-            shm_read((long)(PSUM_PAGE_BASE + nb) * PAGE, acc_buf, PAGE);
-            int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
-            memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
+    } else {
+        /* 大段分块 (n_blk > 1): 串行, 流水待扩展 */
+        for (int64_t m = 0; m < M; m++) {
+            for (int64_t kb = 0; kb < k_tiles; kb++)
+                shm_write((long)(A_PAGE_BASE + kb) * PAGE, x + m * K + kb * TILE, TILE);
+            int64_t mm_done = 0;
+            for (int64_t b = 0; b < n_blk; b++) {
+                int64_t blk_mm = (mm_done + SEG_MAX <= n_mm) ? SEG_MAX : (n_mm - mm_done);
+                shm_write((long)INSTR_BASE * PAGE,
+                          g_fwd_base + g_fwd_off[idx] + mm_done * 6, blk_mm * 6);
+                shm_write((long)INSTR_BASE * PAGE + blk_mm * 6, (const void *)HALT, 6);
+                reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+                while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;
+                reg_write((long)INT_CLEAR_REG, 1);
+                mm_done += blk_mm;
+            }
+            for (int64_t nb = 0; nb < n_tiles; nb++) {
+                int32_t acc_buf[TILE];
+                shm_read((long)(PSUM_PAGE_BASE + nb) * PAGE, acc_buf, PAGE);
+                int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
+                memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
+            }
         }
     }
     Memref2D r = {result, result, 0, M, N, N, 1}; return r;

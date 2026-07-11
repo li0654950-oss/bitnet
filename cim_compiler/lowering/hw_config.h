@@ -20,9 +20,14 @@
 /* 共享缓存 1MB 三区 (§4.6, page 索引) */
 #define SHARED_SIZE   (1 << 20)           /* 1MB */
 #define OVERWRITE_BASE 0x000              /* 覆盖区 (Preload 暂存 / Forward int8 输入) */
-#define A_PAGE_BASE    0x010              /* Forward 输入区 (覆盖区内) */
+#define A_PAGE_BASE    0x010              /* Forward 输入区 (覆盖区内, bank0) */
 #define INSTR_BASE     0xBF0              /* 指令区 (16 PAGE, 4KB) */
-#define PSUM_PAGE_BASE 0xC00              /* 部分和累加区 (累加区) */
+#define PSUM_PAGE_BASE 0xC00              /* 部分和累加区 (累加区, bank0) */
+/* double buffer (S2 流水, A_PAGE/PSUM 各 2 套 ping-pong, m/m+1 隔离, §4.6) */
+#define A_PAGE_BANK1_BASE  0x030          /* A_PAGE bank1 (bank0 0x010+kb 后, 留余量) */
+#define PSUM_BANK1_BASE    0xC20          /* PSUM bank1 (bank0 0xC00+nb 后) */
+#define A_BANK_OFF   (A_PAGE_BANK1_BASE - A_PAGE_BASE)   /* cim_stub patch: a_page += A_BANK_OFF */
+#define P_BANK_OFF   (PSUM_BANK1_BASE - PSUM_PAGE_BASE)  /* cim_stub patch: psum_page += P_BANK_OFF */
 
 /* 指令区容量 (48-bit 指令, 6B/条, §3.1) */
 #define INSTR_PAGES    16

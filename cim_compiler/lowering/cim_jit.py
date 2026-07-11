@@ -261,6 +261,10 @@ def main():
     print(f"[L6] {len(inputs)} input 构造完成, invoke main (T={args.T})...", file=sys.stderr)
 
     logits = invoker.invoke("main", *inputs)
+    if args.sim:
+        st = sim.stats_snapshot()
+        print(f"[L6] cim_cycle={st['cim_cycle']}, mmio_cycle={st['mmio_cycle']} "
+              f"(n_macro={st['n_macro']})", file=sys.stderr)
     ref = model(idx)[0].detach().numpy()
 
     logits = np.asarray(logits)

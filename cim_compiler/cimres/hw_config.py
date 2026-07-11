@@ -16,9 +16,14 @@ TILE_BYTES = TILE * TILE // 4   # 2bit packed tile = 1024B = 4 PAGE
 # 共享缓存 1MB 三区 (§4.6, page 索引)
 SHARED_SIZE = 1 << 20           # 1MB
 OVERWRITE_BASE = 0x000          # 覆盖区 (Preload 暂存 / Forward int8 输入)
-A_PAGE_BASE = 0x010             # Forward 输入区 (覆盖区内)
+A_PAGE_BASE = 0x010             # Forward 输入区 (覆盖区内, bank0)
 INSTR_BASE = 0xBF0              # 指令区 (16 PAGE, 4KB)
-PSUM_PAGE_BASE = 0xC00          # 部分和累加区 (累加区)
+PSUM_PAGE_BASE = 0xC00          # 部分和累加区 (累加区, bank0)
+# double buffer (S2 流水, A_PAGE/PSUM 各 2 套 ping-pong, m/m+1 隔离, §4.6)
+A_PAGE_BANK1_BASE = 0x030       # A_PAGE bank1 (bank0 0x010+kb 后, 留余量)
+PSUM_BANK1_BASE = 0xC20         # PSUM bank1 (bank0 0xC00+nb 后)
+A_BANK_OFF = A_PAGE_BANK1_BASE - A_PAGE_BASE   # cim_stub patch: a_page += A_BANK_OFF
+P_BANK_OFF = PSUM_BANK1_BASE - PSUM_PAGE_BASE  # cim_stub patch: psum_page += P_BANK_OFF
 ACCUM_BASE = PSUM_PAGE_BASE     # 累加区别名 (hw_simulator 用)
 
 # 指令区容量 (48-bit 指令, 6B/条, §3.1)

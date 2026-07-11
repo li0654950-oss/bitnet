@@ -80,6 +80,35 @@ def estimate(mod) -> dict:
     return {"per_func": per_func, "total": total, "n_func": len(per_func)}
 
 
+def estimate_pipeline(mod) -> dict:
+    """S2: 流水后 wall-clock = max(cim_cycle, mmio_搬运) per func。
+
+    串行 wall-clock = cim + 搬运 (CIM idle 等搬运)。
+    流水 wall-clock = max(cim, mmio_pipe), mmio_pipe = cim + doorbell + 读PSUM
+    (写A_PAGE 隐藏在 poll, poll 填充 cim-写A_PAGE 期间)。
+    """
+    from cim_compiler.cimres.hw_simulator import T_SHM, T_REG
+    per_func = []
+    total_serial = total_pipe = 0
+    for func_op, _ in func_blocks(mod):
+        ms = matmuls_in_func(func_op)
+        if not ms:
+            continue
+        cim = estimate_func(ms)
+        k = max(m["k_blk"] for m in ms) + 1
+        n = max(m["n_blk"] for m in ms) + 1
+        xfer = k * T_SHM + n * T_SHM + T_REG        # 搬运 (写A_PAGE+读PSUM+doorbell)
+        serial = cim + xfer                          # 串行: CIM idle 等搬运
+        pipe = max(cim, xfer)                        # 流水: 搬运与计算并行, 取长的 (cim 主导则搬运全隐藏)
+        per_func.append({"name": ms[0]["bitlinear_name"], "cim": cim,
+                         "serial": serial, "pipe": pipe})
+        total_serial += serial
+        total_pipe += pipe
+    return {"per_func": per_func, "total_serial": total_serial,
+            "total_pipe": total_pipe,
+            "speedup": total_serial / max(total_pipe, 1)}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--in", dest="inp", default="cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir")
