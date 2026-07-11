@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "hw_config.h"   /* CIM ASIC 硬件参数 (集中定义, §2.3/§4.5/§4.6/§3.1) */
 
 typedef struct {
     void *allocated;
@@ -45,17 +46,11 @@ typedef struct {
  * 共享缓存 (§4.6, 1MB, PAGE=256B, shm 用 byte offset = page*PAGE):
  *   覆盖区 0x000~0xBEF (3056 PAGE) | 指令区 0xBF0~0xBFF (16 PAGE, 4KB) | 累加区 0xC00~0xFFF
  */
-#define REG_BASE        0x20000000ULL
-#define DOORBELL_REG    (REG_BASE + 0x00)   /* §2.3 写: 指令区起始 byte addr, 唤醒取指 */
-#define INT_CLEAR_REG   (REG_BASE + 0x04)   /* §2.3 写: 清中断 */
-#define IRQ_STATUS_REG  (REG_BASE + 0x08)   /* §2.3 读: 0=idle 1=busy 2=done 3=error */
-#define OVERWRITE_BASE  0x000               /* §4.6 覆盖区 (Preload 暂存 / Forward int8 输入) */
-#define INSTR_BASE      0xBF0               /* §4.6 指令区 (16 PAGE, 4KB) */
-#define A_PAGE_BASE     0x010               /* Forward 输入区 (覆盖区, 与 place.py 一致) */
-#define PSUM_PAGE_BASE  0xC00               /* 部分和累加区 (累加区, 与 place.py 一致) */
-#define PAGE            256
-#define TILE            64
-#define IRQ_DONE        2
+/* cim_stub 派生: 绝对寄存器地址 = REG_BASE + 偏移 (§2.3; REG_BASE/偏移/TILE/PAGE/三区/
+ * IRQ_DONE 等基础参数来自 hw_config.h, 集中定义避免仿真器/生成器漂移) */
+#define DOORBELL_REG    (REG_BASE + DOORBELL_OFF)   /* §2.3 写: 指令区起始 byte addr, 唤醒取指 */
+#define INT_CLEAR_REG   (REG_BASE + INT_CLEAR_OFF)  /* §2.3 写: 清中断 */
+#define IRQ_STATUS_REG  (REG_BASE + IRQ_STATUS_OFF) /* §2.3 读: 0=idle 1=busy 2=done 3=error */
 
 /* ===== MMIO 抽象层 (回调转发 hw_simulator) =====
  * shm: byte offset 索引 hw_simulator 共享缓存 (§4.6 三区)
@@ -197,7 +192,7 @@ Memref2D cim_launch(int64_t idx,
     /* [P2-6] 大段分块: 单段 > 681 MATMUL 时拆块 (指令区 4KB=682 条, 留 1 SYNC_HALT)
        每块 ≤ 681 MATMUL + 末尾 SYNC_HALT, M 循环内多块门铃, 跨块 PSUM_PAGE RMW 累加保留
        (doorbell 只清 busy_until/page_busy 时序, 不清 cache 数据; accum 字段固化保证 K维顺序) */
-    const int64_t SEG_MAX = 681;
+    /* SEG_MAX (大段分块阈值 681) 来自 hw_config.h, 不再局部定义 */
     int64_t n_mm = (int64_t)g_fwd_len[idx] / 6 - 1;  /* MATMUL 数 (减末尾 SYNC_HALT), idx 查 forward.bin */
     int64_t n_blk = (n_mm + SEG_MAX - 1) / SEG_MAX;  /* 块数 (1=不分块) */
     static const uint8_t HALT[6] = {0,0,0,0,0,0xE0};  /* SYNC_HALT word (0x7<<45 小端) */

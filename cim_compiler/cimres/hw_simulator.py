@@ -41,24 +41,8 @@ for _p in (REPO, EXPORT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-TILE = 64
-SHARED_SIZE = 1 << 20
-PAGE = 256
-OVERWRITE_BASE = 0x000
-INSTR_BASE = 0xBF0
-ACCUM_BASE = 0xC00
-A_PAGE_BASE = 0x010
-PSUM_PAGE_BASE = 0xC00
-INSTR_CAPACITY = 16 * PAGE // 6
-PRELOAD_BATCH = INSTR_CAPACITY - 1
-REG_BASE_DEFAULT = 0x20000000
-DOORBELL_OFF = 0x00
-INT_CLEAR_OFF = 0x04
-IRQ_STATUS_OFF = 0x08
-IDLE, BUSY, DONE, ERROR = 0, 1, 2, 3
-OP_PROG_WGT = 0x1
-OP_MATMUL = 0x2
-OP_SYNC_HALT = 0x7
+# CIM ASIC 硬件参数集中定义 (cim_compiler/cimres/hw_config.py, C/Python 镜像)
+from cim_compiler.cimres.hw_config import *   # noqa: F401  TILE/PAGE/三区/INSTR_CAPACITY/PRELOAD_BATCH/REG_BASE_DEFAULT/...
 FORWARD_MAGIC = b"CIMF"
 PRELOAD_MAGIC = b"CIMP"
 

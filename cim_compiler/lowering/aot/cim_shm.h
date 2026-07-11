@@ -2,6 +2,7 @@
 #define CIM_SHM_H
 #include <stdint.h>
 #include <stddef.h>
+#include "hw_config.h"   /* SHARED_SIZE (CIM 共享缓存 1MB, 集中定义) */
 
 /* POSIX 共享内存: C (cim_sim) 与 Python (cim_sim_server.py SharedMemory) 共享 1MB mmap,
  * 承载 CIM 共享缓存 (SharedCache.data, hw_simulator.py)。shm_* 零拷贝零往返 (替代 socket)。
@@ -14,7 +15,7 @@
  */
 
 #define CIM_SHM_NAME "/cim_cache"
-#define CIM_SHM_SIZE (1 << 20)   /* 1MB, 对齐 hw_simulator.SHARED_SIZE */
+#define CIM_SHM_SIZE SHARED_SIZE   /* 1MB, = hw_config.SHARED_SIZE (CIM 共享缓存) */
 
 /* 创建共享内存 (server 用): shm_open(O_CREAT) + ftruncate + mmap -> 指针 */
 void* cim_shm_create(const char* name, size_t size);

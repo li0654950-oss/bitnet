@@ -297,3 +297,7 @@ reg_read:  req [op=4|reg(8)]        -> resp [val(4)]
 - **共享内存模式**（当前）：shm_* 走共享内存零往返，仅 reg_* 走 socket。n=3 ~0.93s / 3307 reg-socket（消除 ~8700 shm 往返，**快 ~40%**）。
 - 剩余开销：reg_* socket 往返（`reg_read` poll IRQ 高频）。阶段 2 优化方向：irq_status 放共享内存控制区 + doorbell 用 eventfd（poll 零往返）。
 - generate O(n²) 累积，大批量仍慢。
+
+2. IR 抽象层次单一——cimres dialect 只有 3 种操作（preload_weight/macro_matmul/sync_halt），从 tile 级直接到指令级。成熟 DSL（Triton 的 block→program、TensorIR 的多级 schedule）有多层 IR 逐步 lowering。这里 place.py 之后基本是直接编码，缺少中间调度 IR。
+3. 无自动调度搜索——place.py 页分配是确定性算法，emit_instr.py 顺序编码。没有调度空间搜索（对比 Ansor 的多阶段搜索、Triton 的 autotune）。对固定 tile 硬件这是合理取舍，但限制了复杂拓扑的优化空间。
+4. 优化 pass 少且硬编码——tile 64×64 固定、分块策略固定。缺算子融合、循环变换、内存复用分析等通用 pass。cim_stub.c 的 A_PAGE/PSUM_PAGE 串行复用是手工设计的，非编译器推导。

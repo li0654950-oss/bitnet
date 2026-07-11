@@ -33,10 +33,7 @@ for _p in (REPO, EXPORT_DIR):
 
 from torch_mlir import ir
 from cim_compiler.cimres.dialect import register_cimres, i32_attr
-
-A_PAGE_BASE = 0x010       # Forward 输入区 (覆盖区, int8 特征)
-PSUM_PAGE_BASE = 0xC00    # 部分和累加区 (int32, 256B/PAGE = 64 int32)
-PRELOAD_BATCH = 681       # 每批 681 tile (指令区 4KB/6B=682 条, 留 1 SYNC_HALT; 闭合 §4.6 764 与指令区矛盾)
+from cim_compiler.cimres.hw_config import A_PAGE_BASE, PSUM_PAGE_BASE, PRELOAD_BATCH  # ASIC 硬件参数 (集中定义)
 
 
 def place(cimres_in, out_path):

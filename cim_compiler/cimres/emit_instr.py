@@ -41,11 +41,8 @@ from torch_mlir import ir
 from cim_compiler.cimres.dialect import register_cimres
 from cim_compiler.export.weight_blob import read_weight_blob
 
-OP_PROG_WGT = 0x1
-OP_MATMUL = 0x2
-OP_SYNC_HALT = 0x7
-PRELOAD_BATCH = 681   # 指令区 4KB/6B=682 条, 留 1 SYNC_HALT
-TILE = 64
+# CIM ASIC 硬件参数集中定义 (cim_compiler/cimres/hw_config.py, C/Python 镜像)
+from cim_compiler.cimres.hw_config import *   # noqa: F401  OP_*/TILE/PRELOAD_BATCH/MACRO_MAX/SEG_MAX
 FORWARD_MAGIC = b"CIMF"
 PRELOAD_MAGIC = b"CIMP"
 
@@ -105,8 +102,6 @@ def emit(placed_path, weights_path, preload_out, forward_out):
     preload_list.sort(key=lambda x: x[0])   # 按 dest_id 排序, 批内连续
 
     # [P1-5] 容量校验 (硬件约束, 友好报错)
-    MACRO_MAX = 4096          # §4.5 Macro 总数上限
-    SEG_MAX = PRELOAD_BATCH   # 681, 指令区 4KB/6B=682 条, 留 1 SYNC_HALT
     n_tile = len(preload_list)
     if n_tile > MACRO_MAX:
         raise ValueError(

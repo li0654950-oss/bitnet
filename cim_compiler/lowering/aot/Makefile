@@ -9,7 +9,7 @@
 # cim_main.c 固定通用宿主: 超参运行时从 model_config.bin 读 (gen_config.py 从 .pt2 提取),
 #   forward 参数个数随 n_layer 变由 libffi 运行时变参调用 (ffi_call) 解决。
 CC = gcc
-CFLAGS = -O2 -fPIC -Wall
+CFLAGS = -O2 -fPIC -Wall -I$(ROOT)/cim_compiler/lowering   # hw_config.h (集中硬件参数)
 PY = /home/li/anaconda3/envs/nanogpt-gpu/bin/python
 
 HERE = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
