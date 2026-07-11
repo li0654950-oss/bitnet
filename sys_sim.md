@@ -298,6 +298,69 @@ reg_read:  req [op=4|reg(8)]        -> resp [val(4)]
 - 剩余开销：reg_* socket 往返（`reg_read` poll IRQ 高频）。阶段 2 优化方向：irq_status 放共享内存控制区 + doorbell 用 eventfd（poll 零往返）。
 - generate O(n²) 累积，大批量仍慢。
 
-2. IR 抽象层次单一——cimres dialect 只有 3 种操作（preload_weight/macro_matmul/sync_halt），从 tile 级直接到指令级。成熟 DSL（Triton 的 block→program、TensorIR 的多级 schedule）有多层 IR 逐步 lowering。这里 place.py 之后基本是直接编码，缺少中间调度 IR。
-3. 无自动调度搜索——place.py 页分配是确定性算法，emit_instr.py 顺序编码。没有调度空间搜索（对比 Ansor 的多阶段搜索、Triton 的 autotune）。对固定 tile 硬件这是合理取舍，但限制了复杂拓扑的优化空间。
-4. 优化 pass 少且硬编码——tile 64×64 固定、分块策略固定。缺算子融合、循环变换、内存复用分析等通用 pass。cim_stub.c 的 A_PAGE/PSUM_PAGE 串行复用是手工设计的，非编译器推导。
+---
+
+## 7. PPA 架构级估算（计算耗时 / 功耗能效 / 面积）
+
+在功能仿真 + cycle 统计基础上，增加架构级 PPA 估算层（`cim_compiler/cimres/ppa_config.py`）。
+定位：**架构级**（±30~50%），非 RTL/后仿级；工艺 **28nm @ 1GHz**。cim_sim 跑完 server
+自动打印 PPA 报告，无需额外命令。
+
+### 7.1 三件套（`ppa_config.py`）
+- **PPAConfig**：工艺/频率/能耗/面积参数表（28nm@1GHz 估算，dataclass 可配置）。
+- **ActivityTracker**：仿真过程活动因子统计（嵌入 `HwCimSimulator`，dispatch/mmio 接入，零语义改动）。
+- **PPAEstimator**：仿真结束 `stats_snapshot` 时算 PPA（cycle->ns / 动态+静态功耗 / 能效 / 面积）。
+
+### 7.2 计算耗时（复用现有并行模型，不改仿真器内核）
+现有 `busy_until` + `SYNC_HALT join` 已建模多 Macro 并行（同 Macro 串行/不同并行 + 同 PSUM_PAGE RMW 串行）。给定 `T_MATMUL`（单 Macro GEMV cycle），`cim_cycle` 即真实并行耗时。PPA 只补两点：
+- **total_cycle 累计**：`Controller.cycle` 只记最后一次 doorbell，加 `total_cycle` 跨 doorbell 累计（PPA 要总耗时）。
+- **频率转 ns**：`period_ns = 1.0 / freq_ghz`（1GHz -> 1ns/cycle），`time = (cim_cycle + mmio_cycle) × period_ns`。
+
+### 7.3 功耗能效（需活动因子统计）
+**活动统计接入点**（4 点，只加计数不改执行）：
+
+| 接入点 | 统计 |
+|---|---|
+| `dispatch_prog_wgt` | SRAM 读 1024B tile |
+| `dispatch_matmul` | 4096 MAC + SRAM 读 64B A_PAGE + 写 256B PSUM |
+| `mmio_shm_*` | 总线字节（CPU<->CIM）|
+| `mmio_reg_*` | 寄存器访问 |
+
+- **动态功耗**：`E_dyn = n_mac·e_mac + sram_read·e_sram_read + sram_write·e_sram_write + bus·e_bus + reg·e_reg`，`P_dyn = E_dyn / time`（pJ/ns = mW）。
+- **静态功耗**：`n_macro · leakage_macro + sram_MB · leakage_sram`。
+- **能效**：`GMACs/W = n_mac / E_total_j / 1e9`，`TOPS/W = 2 × GMACs/W`（1 MAC = 2 OP）。
+- **AOT 共享内存模式**：shm_* 不经 server 回调（C 侧 memcpy 零往返），`bus_bytes=0`，从 CIM 缓存访问推算 `bus = sram_read + sram_write`（同一数据双向：CPU 写 A_PAGE/tile=CIM 读，CPU 读 PSUM=CIM 写）。JIT 模式走 `mmio_shm_*` 回调可直接统计。
+
+### 7.4 面积（纯配置算术，不改仿真器）
+`area = (n_macro × area_macro + SHARED_SIZE × area_sram_byte + logic_gate × area_gate) / util`。资源数（`n_macro`、`SHARED_SIZE`）仿真器已有，面积参数来自 PPAConfig。
+
+### 7.5 报告示例（cim_sim `--prompt R --n 3` 跑完 server 打印）
+```
+[PPA] 工艺 28nm @ 1.0 GHz (架构级估算, ±30~50%)
+  计算耗时: 44793 cycle = 44.793 us (cim=41344 + mmio=3449)
+  功耗:     动态 2853.17 mW + 静态 123.28 mW = 2976.45 mW
+  能效:     675.40 GMACs/W (1350.79 TOPS/W)
+  面积:     Macro 5.50 + SRAM 0.63 + 逻辑 0.020 = 8.78 mm² (util 0.7)
+  活动:     MAC=90046.5k, SRAM读=5038KB, 写=5496KB, 总线=10534KB(推算), reg=3449, Macro=3664
+```
+
+### 7.6 28nm@1GHz 参数（PPAConfig，估算可配置）
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `clock_freq_ghz` | 1.0 | cycle = 1ns |
+| `e_mac_pj` | 1.0 | 每 MAC pJ（int8 × ternary）|
+| `e_sram_read/write_pj_byte` | 2.0 | SRAM pJ/byte |
+| `e_bus_pj_byte` | 1.5 | 总线 pJ/byte |
+| `leakage_per_macro_mw` | 0.02 | Macro 漏电 |
+| `leakage_per_mb_sram_mw` | 50.0 | SRAM 漏电 |
+| `area_macro_um2` | 1500 | 单 64×64 三值 Macro |
+| `area_sram_um2_byte` | 0.6 | SRAM 密度 |
+| `util` | 0.7 | 利用率 |
+
+### 7.7 限制
+- 参数为 28nm 文献量级估算（非 PDK 实测），PPAConfig 可配置替换；要 RTL 级精度需写 Verilog + EDA 综合/仿真。
+- Macro 面积不确定性最高（三值 Macro 无成熟参考，1500 μm² 粗估）。
+- 计算耗时复用 `T_*` 估算 cycle（未精化总线/SRAM/流水建模），架构级趋势估算。
+- `bus_bytes` 为推算（AOT 共享内存特性），JIT 模式可直接统计。
+- 三类 PPA 中只有**功耗**需要改仿真器（加活动统计），**计算耗时**复用现有并行模型、**面积**纯配置算术。
+

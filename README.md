@@ -179,17 +179,21 @@ cim_compiler/
 ├── ir/                  # torch-mlir 降级 (MLIR linalg IR)
 ├── cimres/              # CIM 资源映射 + 指令流 + 仿真器
 │   ├── lower_to_cimres.py / place.py / emit_instr.py  # C1/C2/C3 (IR->指令流)
-│   └── hw_simulator.py   # cycle 级纯硬件仿真器 (HwCimSimulator, Macro 并行时序)
+│   ├── hw_config.py       # ASIC 硬件参数集中定义 (C/Python 镜像, 防漂移)
+│   ├── ppa_config.py      # 架构级 PPA 估算 (PPAConfig + ActivityTracker + PPAEstimator, 28nm@1GHz)
+│   └── hw_simulator.py   # cycle 级纯硬件仿真器 (HwCimSimulator, Macro 并行时序 + PPA 活动统计)
 ├── lowering/            # MLIR -> LLVM + 系统仿真驱动
 │   ├── cim_stub.c          # 固定硬件驱动 (MMIO, 单一 cim_launch(idx), 一次编译任意规模复用)
+│   ├── hw_config.h         # ASIC 硬件参数 (C, 与 hw_config.py 镜像)
 │   ├── cim_jit.py          # JIT 系统仿真 (ExecutionEngine + ctypes 回调, L6)
 │   ├── run_sim_text.py     # JIT 文本生成仿真
 │   ├── to_object.py        # AOT: dump .o (L7)
 │   └── aot/                # AOT 系统仿真 (cim_sim 可执行文件 + IPC server)
-│       ├── cim_main.c / cim_ipc.c / cim_shm.c / cim_runtime.c  # 入口 + IPC(shm+reg) + 共享内存 + consume
-│       ├── cim_sim_server.py                        # Python 仿真器 IPC server
-│       ├── Makefile / run_aot.sh                    # 构建 / 一键启动
-│       └── tokenizer_data.h                         # CharTokenizer C 化数据
+│       ├── cim_main.c / cim_ipc.c / cim_shm.c / cim_runtime.c  # 入口(libffi) + IPC(shm+reg) + 共享内存 + consume
+│       ├── model_config.h / gen_config.py          # 运行时模型配置 (.pt2->model_config.bin, cim_main 固定宿主)
+│       ├── cim_sim_server.py                        # Python 仿真器 IPC server (跑完打印 PPA)
+│       ├── Makefile / run_aot.sh                    # 构建 (-lffi) / 一键启动
+│       └── tokenizer_data.h                         # CharTokenizer C 化数据 (旧, cim_main 改用 model_config)
 └── pipeline.py          # 一键流水线 (9 步, 任意规模自动适配)
 ```
 
@@ -234,11 +238,13 @@ python cim_compiler/lowering/cim_jit.py --sim                # 单次 forward + 
 python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 60   # 文本生成
 
 # === AOT 系统仿真 (CPU 可执行文件 + IPC 仿真器, 跨进程) ===
-make -C cim_compiler/lowering/aot                            # 构建 cim_sim 可执行文件
+make -C cim_compiler/lowering/aot                            # 构建 cim_sim 可执行文件 (-lffi)
 ./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60   # 一键 (nohup server + cim_sim + kill)
 # 或分两步:
 python cim_compiler/lowering/aot/cim_sim_server.py &        # 仿真器 server (先启动, 循环 accept)
 ./cim_compiler/lowering/aot/cim_sim --prompt "ROMEO:" --n 60      # AOT 可执行文件驱动
+# PPA: cim_sim 跑完 server 自动打印架构级 PPA 报告 (28nm@1GHz: 耗时/功耗/能效/面积), 详见 sys_sim.md §7
+#      小批量快速看 PPA: 先启 server, 再 ./cim_sim --prompt R --n 3
 ```
 
 ### 产物
@@ -251,8 +257,9 @@ python cim_compiler/lowering/aot/cim_sim_server.py &        # 仿真器 server (
 | `checkpoints/bitnet_ternary_placeholder.mlir` | L1 降级产物（含 `func.call @cim_launch`）|
 | `cim_compiler/cimres/checkpoints/forward.bin` | CIMF：37 段 MATMUL 指令流（按 idx 索引）|
 | `cim_compiler/cimres/checkpoints/preload.bin` | CIMP：自包含 Preload（tile 数据 + PROG_WGT）|
+| `cim_compiler/cimres/checkpoints/model_config.bin` | CIMC：运行时模型配置（超参+buffer描述+tokenizer, cim_main 固定宿主读）|
 | `cim_compiler/lowering/cim_stub.so` | 固定硬件驱动（MMIO，任意规模复用）|
-| `cim_compiler/lowering/aot/cim_sim` | AOT 可执行文件（ELF）|
+| `cim_compiler/lowering/aot/cim_sim` | AOT 可执行文件（ELF，libffi 运行时变参）|
 
 ### 关键设计
 
@@ -263,6 +270,8 @@ python cim_compiler/lowering/aot/cim_sim_server.py &        # 仿真器 server (
 - **数值/时序解耦**：dispatch 同步算 matmul+RMW（max_diff=0），`busy_until`/`page_busy` 统计 Macro 并行时序。
 - **w_packed 传而不用**：`cim_launch` 不读 W 数据（Preload 已驻留 Macro），W memref 仅 shape 对即可，AOT 模式用空壳。
 - **IPC 共享内存**（AOT）：shm_* 数据走 POSIX 共享内存（C/Python 共享 1MB，零拷贝零往返），reg_* 控制走 socket（同步点）。比纯 socket 快 ~40%（n=3：12010 -> 3307 socket 往返）。
+- **cim_main 固定宿主**：AOT `cim_main.c` 通用宿主，超参运行时从 `model_config.bin` 读（`gen_config.py` 从 .pt2 提取），forward 参数个数随 n_layer 变由 **libffi** 运行时变参调用解决，换模型不改 C 代码。
+- **PPA 架构级估算**：`ppa_config.py` 在仿真器上加活动因子统计，28nm@1GHz 估算计算耗时/功耗能效/面积（±30~50%），cim_sim 跑完 server 自动打印报告（见 `sys_sim.md` §7）。
 
 详见 `sys_sim.md`（系统仿真运行时，JIT + AOT）+ `cim_mlp.md`（CIM 架构规范）。
 

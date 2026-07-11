@@ -43,6 +43,7 @@ for _p in (REPO, EXPORT_DIR):
 
 # CIM ASIC 硬件参数集中定义 (cim_compiler/cimres/hw_config.py, C/Python 镜像)
 from cim_compiler.cimres.hw_config import *   # noqa: F401  TILE/PAGE/三区/INSTR_CAPACITY/PRELOAD_BATCH/REG_BASE_DEFAULT/...
+from cim_compiler.cimres.ppa_config import PPAConfig, ActivityTracker, PPAEstimator  # 架构级 PPA 估算
 FORWARD_MAGIC = b"CIMF"
 PRELOAD_MAGIC = b"CIMP"
 
@@ -155,18 +156,21 @@ class UpstreamArbiter:
 
 class BusDispatcher:
     """多宏分发与总线驱动: Dest_ID 广播路由 (§2.2/§4.7.7)。T_DISPATCH 计入 load/matmul。"""
-    def __init__(self, macros, cache, arbiter):
+    def __init__(self, macros, cache, arbiter, tracker=None):
         self.macros = macros
         self.cache = cache
         self.arbiter = arbiter
+        self.tracker = tracker   # ActivityTracker (PPA 活动统计, 可选)
 
     def dispatch_prog_wgt(self, dest_id, b_page_start, cycle):
         tile = self.cache.read_bytes(b_page_start * PAGE, 1024)
+        if self.tracker: self.tracker.record_prog_wgt()
         return self.macros.load(dest_id, tile, cycle)         # 含 T_DISPATCH+T_PROG_WGT
 
     def dispatch_matmul(self, dest_id, a_page, psum_page, accum, cycle):
         x = self.cache.read_int8_vec(a_page, TILE)
         y, finish = self.macros.matmul(dest_id, x, cycle)     # 含 T_DISPATCH+T_MATMUL
+        if self.tracker: self.tracker.record_matmul()
         return self.arbiter.writeback(psum_page, y, accum, finish)  # T_WB
 
 
@@ -179,6 +183,7 @@ class Controller:
         self.dispatcher = dispatcher
         self.irq_status = IDLE
         self.cycle = 0          # 本次 doorbell 累计 cycle
+        self.total_cycle = 0    # 跨 doorbell 累计 (PPA 总 CIM 耗时)
         self._thread = None
 
     def doorbell(self, instr_byte_addr):
@@ -217,6 +222,7 @@ class Controller:
                     self.irq_status = ERROR
                     return
             self.cycle = cycle
+            self.total_cycle += cycle   # 累计跨 doorbell (PPA 总 CIM 耗时)
             self.irq_status = DONE
         except Exception:
             self.irq_status = ERROR
@@ -230,12 +236,14 @@ class HwCimSimulator:
     """纯硬件 CIM 仿真器: MMIO 接口 + cycle 级时序统计。
     CPU (cim_stub.c) 经 MMIO 读写操作, 硬件门铃异步取指执行。"""
 
-    def __init__(self, reg_base=REG_BASE_DEFAULT, shm_buf=None):
+    def __init__(self, reg_base=REG_BASE_DEFAULT, shm_buf=None, ppa_cfg=None):
         sys.setswitchinterval(0.001)   # 1ms 线程切换 (门铃异步 poll 响应)
         self.cache = SharedCache(shm_buf)
         self.macros = MacroArray()
         self.arbiter = UpstreamArbiter(self.cache)
-        self.dispatcher = BusDispatcher(self.macros, self.cache, self.arbiter)
+        self.tracker = ActivityTracker()                      # PPA 活动因子统计
+        self.ppa_cfg = ppa_cfg or PPAConfig()
+        self.dispatcher = BusDispatcher(self.macros, self.cache, self.arbiter, self.tracker)
         self.controller = Controller(self.cache, self.dispatcher)
         self.REG_BASE = reg_base
         self.DOORBELL_REG = reg_base + DOORBELL_OFF
@@ -248,9 +256,11 @@ class HwCimSimulator:
         v = np.frombuffer(arr, dtype=np.uint8) if isinstance(arr, (bytes, bytearray)) else np.asarray(arr, dtype=np.uint8)
         self.cache.data[byte_addr:byte_addr + len(v)] = v
         self.mmio_cycle += T_SHM
+        self.tracker.record_bus(len(v))
 
     def _shm_read(self, byte_addr, n):
         self.mmio_cycle += T_SHM
+        self.tracker.record_bus(n)
         return self.cache.data[byte_addr:byte_addr + n].copy()
 
     # ---- MMIO 回调 (C 经 ctypes 调用) ----
@@ -258,14 +268,17 @@ class HwCimSimulator:
         arr = np.ctypeslib.as_array(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)), (n,))
         self.cache.data[byte_addr:byte_addr + n] = arr
         self.mmio_cycle += T_SHM
+        self.tracker.record_bus(n)
 
     def mmio_shm_read(self, byte_addr, ptr, n):
         arr = np.ctypeslib.as_array(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)), (n,))
         arr[:] = self.cache.data[byte_addr:byte_addr + n]
         self.mmio_cycle += T_SHM
+        self.tracker.record_bus(n)
 
     def mmio_reg_write(self, reg, val):
         self.mmio_cycle += T_REG
+        self.tracker.record_reg()
         if reg == self.DOORBELL_REG:
             self.controller.doorbell(val)      # 异步启动 _run
         elif reg == self.INT_CLEAR_REG:
@@ -273,6 +286,7 @@ class HwCimSimulator:
 
     def mmio_reg_read(self, reg):
         self.mmio_cycle += T_REG
+        self.tracker.record_reg()
         if reg == self.IRQ_STATUS_REG:
             return int(self.controller.irq_status)
         return 0
@@ -285,9 +299,12 @@ class HwCimSimulator:
             time.sleep(0)   # 让 GIL 给 _run 线程
 
     def stats_snapshot(self):
-        """返回时序统计: CIM cycle / MMIO cycle / Macro 数。"""
+        """返回时序统计 + PPA 估算 (CIM/MMIO cycle / Macro 数 / 功耗时能效面积)。"""
+        ppa = PPAEstimator(self.ppa_cfg, self.tracker, self.controller.total_cycle,
+                           self.mmio_cycle, len(self.macros.macro)).estimate()
         return {
-            "cim_cycle": self.controller.cycle,
+            "cim_cycle": self.controller.total_cycle,
             "mmio_cycle": self.mmio_cycle,
             "n_macro": len(self.macros.macro),
+            "ppa": ppa,
         }

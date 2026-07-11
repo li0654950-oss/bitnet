@@ -25,6 +25,7 @@ for _p in (REPO, EXPORT_DIR):
 
 import numpy as np
 from cim_compiler.cimres.hw_simulator import HwCimSimulator, SHARED_SIZE
+from cim_compiler.cimres.ppa_config import format_ppa_report   # PPA 报告格式化
 
 DEFAULT_SOCKET = "/tmp/cim_sim.sock"
 SHM_NAME = "cim_cache"   # 对齐 cim_shm.h CIM_SHM_NAME ("/cim_cache", Python SharedMemory 内部加 /)
@@ -88,6 +89,7 @@ def main():
             st = sim.stats_snapshot()
             print(f"[server] 连接结束, {n_ops} reg-socket 往返 (shm 走共享内存零往返), "
                   f"cim_cycle={st['cim_cycle']}, mmio_cycle={st['mmio_cycle']}", file=sys.stderr)
+            print(format_ppa_report(st["ppa"]), file=sys.stderr)
     except KeyboardInterrupt:
         pass
     finally:
