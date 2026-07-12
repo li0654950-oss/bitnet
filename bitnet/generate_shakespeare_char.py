@@ -58,6 +58,9 @@ def main():
     p.add_argument("--ternary", action="store_true",
                    help="use 2-bit packed ternary weights + Triton kernel")
     p.add_argument("--ternary_path", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
+    p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"],
+                   help="推理 dtype; 默认 float32 (RoPE 用 float32 cos/sin 会把 q/k 提升为 "
+                        "float32, 与 bfloat16 的 v 不一致致 sdpa 报错, 故默认 float32)")
     args = p.parse_args()
 
     device = args.device or (
@@ -81,7 +84,7 @@ def main():
         n_head=8,
         n_kv_head=4,
         ffn_dim=1664,
-    ).to(device, dtype=torch.bfloat16)
+    ).to(device, dtype=torch.float32 if args.dtype == "float32" else torch.bfloat16)
 
     if args.ternary:
         # 2-bit ternary inference: load packed weights, switch BitLinear to ternary kernel

@@ -214,6 +214,95 @@ def build_inputs(model, idx, exported_program=None):
     return args
 
 
+def build_inputs_kv(model, idx, k_caches, v_caches, cos, sin, exported_program=None):
+    """[接入点③] 增量 KV cache build_inputs: USER_INPUT(idx, k_caches, v_caches, cos, sin) + BUFFER。
+
+    增量 .pt2 的 input_specs: PARAMETER(跳过) + BUFFER(inv_freq/causal_mask/w_packed) +
+    USER_INPUT(idx, k_caches, v_caches, cos, sin, 按 forward 参数顺序填)。
+    """
+    if exported_program is None:
+        exported_program = _ep_cache.get("kv")
+        if exported_program is None:
+            try:
+                import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
+            except ImportError:
+                pass
+            exported_program = torch.export.load(os.path.join(REPO, "checkpoints/bitnet_ternary_kv.pt2"))
+            _ep_cache["kv"] = exported_program
+    ui = [np.ascontiguousarray(idx), np.ascontiguousarray(k_caches),
+          np.ascontiguousarray(v_caches), np.ascontiguousarray(cos), np.ascontiguousarray(sin)]
+    args = []
+    ui_idx = 0
+    for s in exported_program.graph_signature.input_specs:
+        kind = s.kind.name
+        if kind == 'PARAMETER':
+            continue
+        if kind == 'USER_INPUT':
+            args.append(ui[ui_idx]); ui_idx += 1
+            continue
+        t = s.target
+        val = _resolve_attr(model, t)
+        val = val.numpy() if hasattr(val, 'numpy') else np.asarray(val)
+        if t.endswith('w_packed'):
+            args.append(np.ascontiguousarray(val).view(np.int8))
+        elif 'inv_freq' in t:
+            args.append(val.astype(np.float32))
+        elif 'causal_mask' in t:
+            args.append(val.astype(np.bool_))
+        else:
+            args.append(np.ascontiguousarray(val))
+    return args
+
+
+def pick_token(logits, temp, top_k, rng):
+    """从 logits 选 token: temp<=0 greedy argmax; 否则 softmax(temp)+top_k+multinomial。"""
+    l = np.asarray(logits, dtype=np.float32).copy()
+    if temp is None or temp <= 0.0:
+        return int(l.argmax())
+    if top_k is not None and 0 < top_k < l.shape[-1]:
+        kth = np.partition(l, -top_k)[-top_k]   # top_k 大里的最小值 = 阈值
+        l = np.where(l >= kth, l, -np.inf)
+    l = l / temp
+    l = l - l.max()                             # softmax 数值稳定
+    p = np.exp(l); p /= p.sum()
+    return int(rng.choice(p.shape[-1], p=p))
+
+
+def generate_kv(invoker, model, idx0, n, exported_program=None, block_size=256, temp=0.0, top_k=40, rng=None):
+    """[接入点③] JIT 增量 KV cache 生成: prefill prompt 逐 token + decode 单 token (M=1)。
+
+    每步 idx[1] + cache + cos/sin(pos=cache_len), invoke main -> (logits, new_k, new_v),
+    cache 更新 (new_k -> k_caches)。全程 CIM matmul M=1 (decode 单 token), O(n²)->O(n)。
+    """
+    n_layer = len(model.layers)
+    attn0 = model.layers[0].attn
+    n_kv, head_dim = attn0.n_kv, attn0.head_dim
+    inv_freq = attn0.inv_freq.numpy().astype(np.float32)
+    k_caches = np.zeros([n_layer, 1, 0, n_kv, head_dim], dtype=np.float32)   # T=0 首步空 cache
+    v_caches = np.zeros([n_layer, 1, 0, n_kv, head_dim], dtype=np.float32)
+    tokens = idx0[0].tolist()
+
+    def step(tok):
+        nonlocal k_caches, v_caches
+        idx = np.array([[tok]], dtype=np.int64)
+        pos = np.array([float(k_caches.shape[2])], dtype=np.float32)     # cache_len = 当前 T
+        freqs = np.einsum("t,d->td", pos, inv_freq)
+        cos = np.cos(freqs)[None, :, None, :].astype(np.float32)         # [1,1,1,hd/2]
+        sin = np.sin(freqs)[None, :, None, :].astype(np.float32)
+        inputs = build_inputs_kv(model, idx, k_caches, v_caches, cos, sin, exported_program)
+        logits, k_caches, v_caches = invoker.invoke("main", *inputs)
+        return logits
+
+    logits = None
+    for tok in tokens:                    # prefill prompt 逐 token (建 cache)
+        logits = step(tok)
+    for _ in range(n):                    # decode n token (M=1, 用 cache)
+        nxt = pick_token(np.asarray(logits[0, 0]), temp, top_k, rng)
+        tokens.append(nxt)
+        logits = step(nxt)
+    return tokens
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--in", dest="inp", default="checkpoints/bitnet_ternary_placeholder.mlir")

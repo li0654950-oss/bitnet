@@ -10,6 +10,7 @@
  *
  * 磁盘格式 (小端, gen_config.py struct.pack 对应):
  *   "CIMC" magic(4) | n_buffer(u32) | n_layer(u32) | vocab(u32) | block_size(u32)
+ *   | n_kv(u32) | head_dim(u32)
  *   buffer 描述表 (n_buffer 项, 每项紧凑, 不对齐填充):
  *     kind(u8) | rank(u8) | shape[rank](i64*rank)
  *   tokenizer (char-level):
@@ -17,9 +18,12 @@
  *
  * kind: 0=inv_freq(f32[d_head/2]) 1=causal_mask(u8[block,block])
  *       2=w_packed(u8[N,K4] 空壳) 3=lm_head.w_packed(u8[V,K4] 空壳)
- * buffer 顺序 = .pt2 input_specs 顺序 (PARAMETER 跳过, idx=USER_INPUT 最后, 不入表)。
+ * buffer 顺序 = .pt2 input_specs 顺序 (PARAMETER 跳过, USER_INPUT 在最后, 不入表)。
  *   即每层 8 个 (inv_freq, causal_mask, q/k/v/o_proj.w_packed, fc1.w_packed, fc2.w_packed)
  *   + lm_head.w_packed; n_buffer = n_layer*8 + 1。
+ * n_kv/head_dim: 增量 KV 模式用 (cache shape [n_layer,1,T,n_kv,head_dim], 从 k_caches
+ *   placeholder shape 反推); 全序列模式填 0/n_kv, head_dim=inv_freq.shape[0]*2。
+ *   增量 USER_INPUT 顺序固定: idx, k_caches, v_caches, cos, sin (cim_main 硬编码)。
  */
 
 #define MC_MAGIC 0x434D4943u   /* "CIMC" 小端 (字节 43 49 4D 43) */
@@ -40,13 +44,16 @@ typedef struct {
 
 typedef struct {
     uint32_t magic;
-    uint32_t n_buffer;    /* 不含 idx */
+    uint32_t n_buffer;    /* 不含 USER_INPUT (idx 全序列1个 / 增量5个) */
     uint32_t n_layer;
     uint32_t vocab;
     uint32_t block_size;
+    uint32_t n_kv;        /* 增量 KV: n_kv_head (cache shape[3]); 全序列 0 */
+    uint32_t head_dim;    /* head 维度 (cache shape[4] / inv_freq*2) */
     BufferDesc* buffers;  /* [n_buffer], malloc */
     char*     itos;       /* [vocab], malloc */
     int32_t   stoi[128];  /* ascii -> id, -1 未知 */
+    float*    inv_freq_data;  /* [head_dim/2], malloc (和 model 一致, 非 powf 运行时算 -- powf vs torch pow 浮点差) */
 } ModelConfig;
 
 #endif /* MODEL_CONFIG_H */

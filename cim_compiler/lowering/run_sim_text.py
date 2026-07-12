@@ -36,8 +36,9 @@ def _load_cim_jit():
     return m
 
 
-def generate(invoker, model, idx0, n, block_size, ref=False):
-    """greedy 自回归生成 n token, 返回 token 列表 (含 prompt)。"""
+def generate(invoker, model, idx0, n, block_size, ref=False, temp=0.0, top_k=40, rng=None):
+    """greedy/采样 自回归生成 n token, 返回 token 列表 (含 prompt)。"""
+    import cim_jit as _cj
     idx = idx0.clone()
     tokens = idx[0].tolist()
     for i in range(n):
@@ -49,7 +50,7 @@ def generate(invoker, model, idx0, n, block_size, ref=False):
         else:
             inputs = _build_inputs(model, idx)
             logits = np.asarray(invoker.invoke("main", *inputs))
-        nxt = int(np.argmax(logits[0, -1])) if not ref else int(logits[0, -1].argmax())
+        nxt = _cj.pick_token(logits[0, -1], temp, top_k, rng)
         tokens.append(nxt)
         idx = torch.cat([idx, torch.tensor([[nxt]], dtype=torch.long)], dim=1)
         if (i + 1) % 10 == 0:
@@ -74,7 +75,14 @@ def main():
     p.add_argument("--block_size", type=int, default=256)
     p.add_argument("--sim", action="store_true", default=True, help="用 hw_simulator MMIO 仿真")
     p.add_argument("--no-ref", action="store_true", help="跳过 PyTorch reference")
+    p.add_argument("--kv", action="store_true", help="接入点③: 增量 KV cache (decode M=1, O(n²)->O(n))")
+    p.add_argument("--temperature", type=float, default=0.0,
+                   help="采样温度; <=0 greedy (默认, token 级验证); >0 启用采样 (softmax+top_k+multinomial)")
+    p.add_argument("--top_k", type=int, default=40, help="采样 top_k 截断")
+    p.add_argument("--seed", type=int, default=0, help="采样随机种子 (JIT/ref 各用独立同 seed rng)")
     args = p.parse_args()
+    if args.kv and args.inp == "checkpoints/bitnet_ternary_placeholder.mlir":
+        args.inp = "checkpoints/bitnet_ternary_kv_placeholder.mlir"
 
     # ---- tokenizer (文本 prompt) 或 int prompt (合并自 generate.py) ----
     tok = None
@@ -119,14 +127,28 @@ def main():
     model = build_inference_model(args.ternary, vocab_size=65)
 
     # ---- JIT 仿真生成 ----
-    print(f"[run] JIT 仿真自回归生成 {args.n} token...", file=sys.stderr)
-    jit_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=False)
+    mode = "采样" if args.temperature > 0 else "greedy"
+    rng_jit = np.random.default_rng(args.seed)
+    rng_ref = np.random.default_rng(args.seed)      # 同 seed 独立 rng: logits 一致则采样一致
+    print(f"[run] JIT 仿真自回归生成 {args.n} token... [{mode}]" + (" [KV cache 增量]" if args.kv else ""), file=sys.stderr)
+    if args.kv:
+        ep = torch.export.load(os.path.join(REPO, "checkpoints/bitnet_ternary_kv.pt2"))
+        jit_tokens = cim_jit.generate_kv(invoker, model, idx0, args.n, ep, args.block_size,
+                                         temp=args.temperature, top_k=args.top_k, rng=rng_jit)
+    else:
+        jit_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=False,
+                              temp=args.temperature, top_k=args.top_k, rng=rng_jit)
+    if args.sim:
+        st = sim.stats_snapshot()
+        print(f"[run] JIT {'KV增量' if args.kv else '全序列'} cim_cycle={st['cim_cycle']}, "
+              f"mmio_cycle={st['mmio_cycle']}", file=sys.stderr)
 
     # ---- PyTorch reference ----
     ref_tokens = None
     if not args.no_ref:
         print("[run] PyTorch reference 生成...", file=sys.stderr)
-        ref_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=True)
+        ref_tokens = generate(invoker, model, idx0, args.n, args.block_size, ref=True,
+                              temp=args.temperature, top_k=args.top_k, rng=rng_ref)
 
     # ---- 输出 (int 模式: token 列表; 文本模式: decode 文本) ----
     print("\n" + "=" * 60, file=sys.stderr)
@@ -136,7 +158,7 @@ def main():
         if ref_tokens is not None:
             match = jit_tokens == ref_tokens
             print(f"PyTorch ref 输出: {ref_tokens}")
-            print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
+            print(f"JIT==ref ({mode} token 级): {'✓ YES' if match else '✗ NO'}")
     else:
         jit_text = tok.decode(jit_tokens)
         print(f"prompt  : {args.prompt!r}")
@@ -149,7 +171,9 @@ def main():
             print(f"PyTorch ref 输出:")
             print(ref_text)
             print("-" * 60)
-            print(f"JIT==ref (greedy token 级): {'✓ YES' if match else '✗ NO'}")
+            print(f"JIT==ref ({mode} token 级): {'✓ YES' if match else '✗ NO'}")
+            if not match and args.temperature > 0:
+                print("(采样模式: 编译降级 logits 微差在敏感 token 翻转采样, != 不代表 bug)")
     print("=" * 60, file=sys.stderr)
 
 

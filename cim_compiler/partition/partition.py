@@ -49,6 +49,7 @@ class CimBlock:
     w_packed: str             # w_packed placeholder 节点名
     x_int8_in: str            # CPU->CIM 边界: 激活 int8 输入节点名
     acc_out: str              # CIM->CPU 边界: int32 输出节点名 (cim.matmul op 本身)
+    is_kv_proj: bool = False  # S3: 是否 K/V proj (KV cache 产出者, bitlinear_name 含 k.proj/v.proj)
 
 
 @dataclass
@@ -173,6 +174,8 @@ def partition_graph(prog) -> Partition:
         wp_name = w_packed.name if w_packed else "?"
         target = ph_to_target.get(wp_name, wp_name)   # 优先 target 名 (鲁棒)
         bitlinear_name = _parse_bitlinear_name(target) if w_packed else "?"
+        # S3: 标注 K/V proj (KV cache 产出者) -- 解析后 k_proj/v_proj -> k.proj/v.proj
+        is_kv = bitlinear_name.endswith("k.proj") or bitlinear_name.endswith("v.proj")
 
         cim_blocks.append(CimBlock(
             idx=idx,
@@ -181,6 +184,7 @@ def partition_graph(prog) -> Partition:
             w_packed=w_packed.name if w_packed else "?",
             x_int8_in=x_int8.name,
             acc_out=mm.name,
+            is_kv_proj=is_kv,
         ))
         cpu_to_cim.append(Boundary(
             node=x_int8.name, direction="cpu_to_cim",
@@ -208,6 +212,7 @@ def to_json(part: Partition, path: str) -> dict:
             "cpu_nodes": len(part.cpu_nodes),
             "cim_nodes": len(part.cim_nodes),
             "cim_blocks": len(part.cim_blocks),
+            "kv_proj": sum(1 for b in part.cim_blocks if b.is_kv_proj),
         },
         "node_backend": part.node_backend,
         "cim_blocks": [asdict(b) for b in part.cim_blocks],

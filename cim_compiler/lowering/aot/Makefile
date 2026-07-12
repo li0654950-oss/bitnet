@@ -17,6 +17,7 @@ ROOT = $(abspath $(HERE)/../../..)
 STUB_C = $(ROOT)/cim_compiler/lowering/cim_stub.c
 
 OBJ = $(ROOT)/checkpoints/bitnet_ternary.o
+KV_OBJ = $(ROOT)/checkpoints/bitnet_ternary_kv.o
 STUB_O = cim_stub.o
 RUNTIME_O = cim_runtime.o
 IPC_O = cim_ipc.o
@@ -24,10 +25,12 @@ SHM_O = cim_shm.o
 MAIN_O = cim_main.o
 RUNTIME_SO = cim_runtime.so
 SIM = cim_sim
+KV_SIM = cim_sim_kv
 SOCK = /tmp/cim_sim.sock
 CONFIG = $(ROOT)/cim_compiler/cimres/checkpoints/model_config.bin
+KV_CONFIG = $(ROOT)/cim_compiler/cimres/checkpoints/model_config_kv.bin
 
-all: $(SIM) $(CONFIG)
+all: $(SIM) $(CONFIG) $(KV_SIM) $(KV_CONFIG)
 
 # 1. cim_runtime.so (C 版 consume ciface, to_object.py dump .o 要求 symbol resolved)
 $(RUNTIME_SO): cim_runtime.c cim_runtime.h
@@ -41,6 +44,15 @@ $(OBJ): $(ROOT)/checkpoints/bitnet_ternary_placeholder.mlir $(STUB_C) $(RUNTIME_
 		--runtime-so cim_compiler/lowering/aot/$(RUNTIME_SO) \
 		--out checkpoints/bitnet_ternary.o
 	objcopy --redefine-sym main=forward_entry $(OBJ)
+
+# 2b. 增量 KV: to_object dump bitnet_ternary_kv.o + objcopy (多输出 consume mrf32_mrf32_mrf32)
+$(KV_OBJ): $(ROOT)/checkpoints/bitnet_ternary_kv_placeholder.mlir $(STUB_C) $(RUNTIME_SO)
+	cd $(ROOT) && $(PY) cim_compiler/lowering/to_object.py \
+		--in checkpoints/bitnet_ternary_kv_placeholder.mlir \
+		--so cim_compiler/lowering/cim_stub.so \
+		--runtime-so cim_compiler/lowering/aot/$(RUNTIME_SO) \
+		--out checkpoints/bitnet_ternary_kv.o
+	objcopy --redefine-sym main=forward_entry $(KV_OBJ)
 
 # 3. cim_stub.o (cim_launch + register_cim_hw_sim + cim_load_forward + cim_preload_init)
 $(STUB_O): $(STUB_C)
@@ -66,9 +78,17 @@ $(MAIN_O): cim_main.c cim_runtime.h cim_ipc.h model_config.h
 $(SIM): $(OBJ) $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O)
 	$(CC) -o $@ $(OBJ) $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O) -lm -lrt -lffi
 
+# 7b. 链接 cim_sim_kv (增量 KV: bitnet_ternary_kv.o + 共享 cim_main.o/cim_runtime.o)
+$(KV_SIM): $(KV_OBJ) $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O)
+	$(CC) -o $@ $(KV_OBJ) $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O) -lm -lrt -lffi
+
 # 8. gen_config: 从 .pt2 提取 model_config.bin (cim_main 运行时读, 规模参数化)
 $(CONFIG): $(ROOT)/checkpoints/bitnet_ternary.pt2 $(HERE)/gen_config.py
 	cd $(ROOT) && $(PY) cim_compiler/lowering/aot/gen_config.py
+
+# 8b. gen_config --kv: 增量 .pt2 -> model_config_kv.bin (含 n_kv/head_dim)
+$(KV_CONFIG): $(ROOT)/checkpoints/bitnet_ternary_kv.pt2 $(HERE)/gen_config.py
+	cd $(ROOT) && $(PY) cim_compiler/lowering/aot/gen_config.py --kv
 
 # 自动启动 server + 跑 cim_sim (从 repo root, forward/preload/config 路径相对 repo root)
 run: $(SIM) $(CONFIG)
@@ -76,5 +96,11 @@ run: $(SIM) $(CONFIG)
 	sleep 1 && cd $(ROOT) && ./cim_compiler/lowering/aot/$(SIM) --socket $(SOCK) --n 3; \
 	wait
 
+# 增量 KV: 启动 server + 跑 cim_sim_kv --kv (O(n²)->O(n) decode M=1)
+run_kv: $(KV_SIM) $(KV_CONFIG)
+	cd $(ROOT) && $(PY) cim_compiler/lowering/aot/cim_sim_server.py --socket $(SOCK) & \
+	sleep 1 && cd $(ROOT) && ./cim_compiler/lowering/aot/$(KV_SIM) --socket $(SOCK) --kv --n 3; \
+	wait
+
 clean:
-	rm -f $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O) $(RUNTIME_SO) $(SIM)
+	rm -f $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O) $(RUNTIME_SO) $(SIM) $(KV_SIM)
