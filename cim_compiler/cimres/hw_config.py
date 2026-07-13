@@ -50,3 +50,27 @@ IDLE, BUSY, DONE, ERROR = 0, 1, 2, 3
 OP_PROG_WGT = 0x1
 OP_MATMUL = 0x2
 OP_SYNC_HALT = 0x7
+
+# ===== S4 布局延迟模型 (2D Mesh NoC, 研究性假设, 非 spec) =====
+# 注: cim_mlp.md §2.2 定义 CIM 为内部广播总线 (BusDispatcher 同时广播全部 4096 Macro,
+# T_DISPATCH=2 固定, 与 dest 位置无关), 规范无 2D Mesh/路由器。故:
+#   T_ROUT_PER_HOP = 0   -> spec-faithful 广播总线基线 (cycle=6268, 真实模型, 默认)
+#   T_ROUT_PER_HOP > 0   -> "广播总线换 Mesh NoC" 研究假设 (无 spec 依据, cycle 上升非下降)
+# Mesh+layout 在所有 T_ROUT 下劣于广播总线; hotspot -9.6% 是相对 Mesh 假设基线的减损,
+# 非相对真实硬件提升。保留作 layout 优化研究 + autotuner 框架, 不产生实际性能收益。
+MESH_DIM = 64                      # 64x64 Mesh = 4096 Macro (研究假设拓扑, 非 spec)
+T_ROUT_PER_HOP = 0                 # 0=spec 广播总线基线; >0=Mesh NoC 研究假设 (路由跳数 cycle)
+LAYOUT_MAP = None                  # {dest_id: (x,y)} 重映射 (None=线性扫描; macro_layout 设置)
+
+def dest_to_xy(dest_id, mesh_dim=MESH_DIM):
+    """dest_id -> (x, y) 物理坐标 (LAYOUT_MAP 设置则重映射, 否则线性扫描)。"""
+    if LAYOUT_MAP is not None:
+        xy = LAYOUT_MAP.get(dest_id)
+        if xy is not None:
+            return xy
+    return dest_id % mesh_dim, dest_id // mesh_dim
+
+def dest_origin_hops(dest_id, mesh_dim=MESH_DIM):
+    """dest 到原点(0,0)的 Manhattan 距离 = 指令分发路由跳数 (总线入口假设在原点)。"""
+    x, y = dest_to_xy(dest_id, mesh_dim)
+    return x + y

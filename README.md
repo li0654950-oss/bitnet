@@ -190,8 +190,10 @@ cim_compiler/
 │   ├── lower_to_cimres.py / place.py / emit_instr.py  # C1/C2/C3 (IR->指令流)
 │   ├── hw_config.py       # ASIC 硬件参数集中定义 (C/Python 镜像, 防漂移)
 │   ├── ppa_config.py      # 架构级 PPA 估算 (PPAConfig + ActivityTracker + PPAEstimator, 28nm@1GHz)
-│   ├── cost_model.py      # CIM cycle 评估 (estimate + estimate_kv, S3 KV cache O(n²)->O(n) 量化)
-│   └── hw_simulator.py   # cycle 级纯硬件仿真器 (HwCimSimulator, Macro 并行时序 + PPA 活动统计)
+│   ├── cost_model.py      # CIM cycle 评估 (estimate + estimate_kv, S3 KV cache O(n²)->O(n); S4 layout-aware 路由延迟)
+│   ├── macro_layout.py    # S4 dest_id->2D(x,y) 布局策略 (linear/hotspot/bitlinear_cluster)
+│   ├── autotuner.py       # S4 布局搜索选优 (枚举策略 + cost_model 评估, hotspot -9.6%)
+│   └── hw_simulator.py   # cycle 级纯硬件仿真器 (HwCimSimulator, Macro 并行时序 + PPA + S4 路由延迟)
 ├── lowering/            # MLIR -> LLVM + 系统仿真驱动
 │   ├── cim_stub.c          # 固定硬件驱动 (MMIO, 单一 cim_launch(idx), 一次编译任意规模复用)
 │   ├── hw_config.h         # ASIC 硬件参数 (C, 与 hw_config.py 镜像)
@@ -268,6 +270,14 @@ python cim_compiler/lowering/aot/cim_sim_server.py --socket /tmp/cim_sim.sock &
 # === KV cache CIM cycle 量化 (cost_model, 不跑仿真器, 秒级) ===
 python cim_compiler/cimres/cost_model.py --kv 80    # n=80: 全序列重算 vs KV cache cycle + speedup (40.5x, 实测 42x)
 python cim_compiler/cimres/cost_model.py --kv       # 对比表 n=32/64/128/256 (speedup ≈ (n+1)/2, O(n²)->O(n))
+
+# === S4 布局优化 + autotuning (2D Mesh NoC 研究假设; spec 广播总线 T_ROUT=0 基线不变) ===
+python cim_compiler/cimres/macro_layout.py --strategy hotspot --rout 1   # 单策略布局评估 (linear/hotspot/bitlinear_cluster)
+python cim_compiler/cimres/autotuner.py --rout 1                          # 搜索选优 + 序列化 layout_config.json (hotspot Mesh 模型下减损 9.6%)
+# autotuner 生成 layout_config.json 后, cim_sim_server 自动加载 (跨进程传播 LAYOUT_MAP+T_ROUT):
+./cim_compiler/lowering/aot/run_aot_kv.sh --prompt "ROMEO:" --n 80        # 实际 cim_cycle 反映 hotspot (T_ROUT=1)
+# 注: T_ROUT>0 是 Mesh NoC 研究假设 (cim_mlp.md §2.2 spec 为广播总线, T_ROUT=0 基线不受 layout 影响);
+#     hotspot 降 9.2% vs linear (同 T_ROUT=1), 相对 spec 基线 cycle 上升 (Mesh 更贵, 非实际硬件提升)
 
 # === KV cache 数值验收 (PyTorch ref: 全序列 use_cache=False vs 增量 KV cache greedy) ===
 python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n=128 良性浮点分歧 (relu² 放大)

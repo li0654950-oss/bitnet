@@ -32,7 +32,8 @@ for _p in (REPO, EXPORT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from cim_compiler.cimres.hw_simulator import T_FETCH, T_DISPATCH, T_MATMUL, T_WB
+from cim_compiler.cimres.hw_simulator import T_FETCH, T_DISPATCH, T_MATMUL, T_WB, dest_origin_hops
+from cim_compiler.cimres import hw_config      # T_ROUT_PER_HOP 运行时查表 (与 hw_simulator 一致, S4+ 修复)
 from cim_compiler.cimres.passes.common import func_blocks, matmuls_in_func
 
 
@@ -48,7 +49,7 @@ def estimate_func(ms) -> int:
     for m in ms:
         cycle += T_FETCH
         start = max(cycle, macro_busy.get(m["dest_id"], 0))
-        finish = start + T_DISPATCH + T_MATMUL
+        finish = start + T_DISPATCH + dest_origin_hops(m["dest_id"]) * hw_config.T_ROUT_PER_HOP + T_MATMUL
         macro_busy[m["dest_id"]] = finish
         wb_start = max(finish, page_busy.get(m["psum_page"], 0))
         page_busy[m["psum_page"]] = wb_start + T_WB

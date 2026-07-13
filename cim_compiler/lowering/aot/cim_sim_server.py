@@ -26,6 +26,7 @@ for _p in (REPO, EXPORT_DIR):
 import numpy as np
 from cim_compiler.cimres.hw_simulator import HwCimSimulator, SHARED_SIZE
 from cim_compiler.cimres.ppa_config import format_ppa_report   # PPA 报告格式化
+from cim_compiler.cimres import hw_config      # S4+: LAYOUT_MAP + T_ROUT_PER_HOP (layout_config.json 加载)
 
 DEFAULT_SOCKET = "/tmp/cim_sim.sock"
 SHM_NAME = "cim_cache"   # 对齐 cim_shm.h CIM_SHM_NAME ("/cim_cache", Python SharedMemory 内部加 /)
@@ -45,6 +46,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--socket", default=DEFAULT_SOCKET)
     args = p.parse_args()
+
+    # S4+: 加载 autotuner 序列化的 layout_config.json (LAYOUT_MAP + T_ROUT_PER_HOP)
+    # 使实际仿真 cycle 反映 layout 优化 (hotspot vs linear); 不存在则 spec 广播总线基线 (T_ROUT=0)
+    import json as _json
+    _layout_cfg = os.path.join(CIM_COMPILER, "cimres", "checkpoints", "layout_config.json")
+    if os.path.exists(_layout_cfg):
+        with open(_layout_cfg) as _f:
+            _cfg = _json.load(_f)
+        hw_config.LAYOUT_MAP = {int(k): tuple(v) for k, v in _cfg["layout_map"].items()}
+        hw_config.T_ROUT_PER_HOP = _cfg["t_rout_per_hop"]
+        print(f"[server] 加载 layout_config.json: strategy={_cfg['strategy']} "
+              f"T_ROUT={_cfg['t_rout_per_hop']} ({len(hw_config.LAYOUT_MAP)} Macro)", file=sys.stderr)
+    else:
+        print(f"[server] 无 layout_config.json, 用 spec 广播总线基线 (T_ROUT=0)", file=sys.stderr)
 
     # 创建共享内存 (承载 CIM 共享缓存, C/Python 共享; 残留则打开已有)
     try:
