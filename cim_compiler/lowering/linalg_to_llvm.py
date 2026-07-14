@@ -69,7 +69,7 @@ def cim_call_to_memref(mod):
         if str(op.name) == "func.call":
             ca = op.attributes.get("callee")
             callee = ca.value if hasattr(ca, "value") else str(ca).strip('"')
-            if callee == "cim_launch":
+            if callee.startswith("cim_launch"):  # S6: cim_launch + cim_launch_qkv
                 calls.append(op)
         return ir.WalkResult.ADVANCE
 
@@ -145,8 +145,8 @@ def main():
     with open(args.out, "w") as f:
         f.write(out)
 
-    n_call = out.count("call @cim_launch_")
-    n_decl = out.count("llvm.func @cim_launch_") + out.count("llvm.func private @cim_launch_")
+    n_call = out.count("call @cim_launch")
+    n_decl = out.count("llvm.func @cim_launch") + out.count("llvm.func private @cim_launch")
     n_llvm = out.count("llvm.")
     n_generic = out.count("linalg.generic")
     n_tm = out.count("tm_tensor.")
@@ -155,8 +155,8 @@ def main():
           f"残留 linalg.generic={n_generic}, tm_tensor={n_tm}", file=sys.stderr)
     print(f"[L4] saved: {args.out}", file=sys.stderr)
 
-    ok = (n_call == 37 and n_generic == 0 and n_tm == 0)
-    print(f"\n[L4] {'PASS ✓ (LLVM IR, 37 func.call external stub 保留)' if ok else 'FAIL ✗'}",
+    ok = (n_call == 25 and n_generic == 0 and n_tm == 0)
+    print(f"\n[L4] {'PASS ✓ (LLVM IR, 25 func.call external stub 保留: 6 qkv + 19 单)' if ok else 'FAIL ✗'}",
           file=sys.stderr)
     sys.exit(0 if ok else 1)
 

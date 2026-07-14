@@ -28,6 +28,7 @@ int8 tensor, 替换整条 cast 链为一个 func.call @cim_launch_<idx>:
 """
 import os
 import sys
+import json
 import argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,8 +47,54 @@ def _owner(v):
     return v.owner
 
 
-def lower_linalg_to_cim_call(mod) -> int:
-    """把 placeholder 降级的 linalg.matmul 替换为 func.call @cim_launch_<idx>。返回替换数。"""
+def _block_ops_before(target_op):
+    """target_op 所在 block 中 target_op 之前的 op id set (S6 阶段2 IR 变换用)。"""
+    p = target_op.operation.parent
+    # MLIR Python: parent 可能是 Block (有 operations) 或 enclosing Operation (func.func)
+    block = p if hasattr(p, 'operations') else p.regions[0].blocks[0]
+    s = set()
+    target = target_op.operation
+    for o in block.operations:
+        if o == target:
+            break
+        s.add(o)  # Operation hash/eq 基于 pointer (跨 wrapper)
+    return s
+
+
+def _collect_movable(si32_vals, v_mm):
+    """BFS 收集 si32_vals 的 transitive use op, 仅含 v_mm 前的 op (需移到 call result 后)。
+
+    S6 阶段2 dominance 修复: q/k proj 后下游链 (si32->sitofp->RMSNorm div->reshape->
+    expand_shape) 在 v proj 前, qkv call 在 v proj 前插入, call result 不 dominate 这些
+    下游 op。收集 q/k si32 的 transitive use (仅 v_mm 前的), 移到 call result 后恢复
+    dominance。非 si32 依赖的 operand (RMSNorm weight gamma / 形状计算 from_elements)
+    不收集, 仍留在 v_mm 前, dominate 移动后的 op。
+    """
+    before = _block_ops_before(v_mm)
+    seen = set()
+    queue = list(si32_vals)
+    val_seen = set(si32_vals)
+    movable = []
+    while queue:
+        v = queue.pop(0)
+        for use in v.uses:
+            op = use.owner
+            if op in seen:
+                continue
+            if op not in before:  # 只移 v_mm 前的 (v 链已在 v_mm 后, 不动)
+                continue
+            seen.add(op)
+            movable.append(op)
+            for r in op.results:
+                if r not in val_seen:
+                    val_seen.add(r)
+                    queue.append(r)
+    return movable
+
+
+def lower_linalg_to_cim_call(mod, partition_path=None) -> int:
+    """把 placeholder 降级的 linalg.matmul 替换为 func.call @cim_launch / @cim_launch_qkv。
+    S6 shape 启发式: 3 连续 matmul W shape [Nq>Nk=Nv] (GQA) 识别 qkv, 合并为 cim_launch_qkv。返回 call 数。"""
     ctx = mod.context
     matmuls = []
 
@@ -58,69 +105,101 @@ def lower_linalg_to_cim_call(mod) -> int:
 
     mod.operation.walk(find)
 
-    # [A1] 单一 @cim_launch 声明 (动态 shape, 任意规模统一; idx 常量参数)
+    # declare @cim_launch (单输出) + @cim_launch_qkv (S6: 6 输入 Xq/Wq/Xk/Wk/Xv/Wv -> 3 输出 Q/K/V)
     i64_type = ir.IntegerType.get_signless(64, ctx)
     dyn_i8 = ir.Type.parse("tensor<?x?xi8>", ctx)
     dyn_i32 = ir.Type.parse("tensor<?x?xi32>", ctx)
-    launch_ft = ir.FunctionType.get(inputs=[i64_type, dyn_i8, dyn_i8],
-                                    results=[dyn_i32], context=ctx)
+    launch_ft = ir.FunctionType.get(inputs=[i64_type, dyn_i8, dyn_i8], results=[dyn_i32], context=ctx)
+    launch_qkv_ft = ir.FunctionType.get(inputs=[i64_type, dyn_i8, dyn_i8, dyn_i8, dyn_i8, dyn_i8, dyn_i8],
+                                        results=[dyn_i32, dyn_i32, dyn_i32], context=ctx)
     with ctx, ir.InsertionPoint.at_block_begin(mod.body):
-        func_d.FuncOp(name="cim_launch", type=launch_ft, visibility="private",
-                      loc=ir.Location.unknown(ctx))
+        func_d.FuncOp(name="cim_launch", type=launch_ft, visibility="private", loc=ir.Location.unknown(ctx))
+        func_d.FuncOp(name="cim_launch_qkv", type=launch_qkv_ft, visibility="private", loc=ir.Location.unknown(ctx))
 
-    for idx, mm in enumerate(matmuls):
+    def parse_mm(mm):
+        """追溯 matmul 的 X_si8 / W_packed(block arg) / si32_result + kill 链 ops。"""
         loc = mm.location
-        # ---- 追溯输入 ----
-        # ins[0] f32 <- sitofp generic <- X_si8
         sitofp_gen = _owner(mm.operands[0])
-        assert str(sitofp_gen.name) == "linalg.generic", f"ins0 非 generic: {sitofp_gen.name}"
         X_si8 = sitofp_gen.operands[0]
-        # ins[1] f32 <- uitofp generic <- transpose <- collapse <- broadcast generic <- W_packed
         uitofp_gen = _owner(mm.operands[1])
-        assert str(uitofp_gen.name) == "linalg.generic", f"ins1 非 generic: {uitofp_gen.name}"
         transpose = _owner(uitofp_gen.operands[0])
         collapse = _owner(transpose.operands[0])
         broadcast_gen = _owner(collapse.operands[0])
-        W_packed = broadcast_gen.operands[0]  # block arg, 原始 packed ternary
-        # result f32 -> fptosi generic -> si32
+        W_packed = broadcast_gen.operands[0]   # block arg (BlockArgument)
         fptosi_gen = None
         for u in mm.results[0].uses:
             if str(u.owner.name) == "linalg.generic":
                 fptosi_gen = u.owner
                 break
-        assert fptosi_gen is not None, "matmul result 无 fptosi generic use"
         si32_result = fptosi_gen.results[0]
-        # outs (init 0, 通常 linalg.fill)
         fill = None
         outs_v = mm.operands[2]
-        if hasattr(outs_v.owner, "name"):  # OpResult -> Operation
+        if hasattr(outs_v.owner, "name"):
             fill = outs_v.owner
+        try: W_shape = list(W_packed.type.shape)   # [N, K4] (S6 shape 启发式)
+        except Exception: W_shape = []
+        return {"X": X_si8, "W": W_packed, "W_shape": W_shape, "si32": si32_result,
+                "kill": [fptosi_gen, mm, uitofp_gen, transpose, collapse, broadcast_gen, sitofp_gen] + ([fill] if fill else []),
+                "loc": loc}
 
-        # ---- 插入 func.call @cim_launch(idx, X, W) [A1] cast 到动态 shape (单一 declare) ----
-        with ir.InsertionPoint(mm):
-            idx_const = arith_d.ConstantOp(i64_type, ir.IntegerAttr.get(i64_type, idx), loc=loc)
-            x_dyn = tensor_d.CastOp(dyn_i8, X_si8, loc=loc).result
-            w_dyn = tensor_d.CastOp(dyn_i8, W_packed, loc=loc).result
-            call = func_d.CallOp([dyn_i32], "cim_launch",
-                                 [idx_const.result, x_dyn, w_dyn], loc=loc)
-            res_back = tensor_d.CastOp(si32_result.type, call.results[0], loc=loc).result
+    parsed = [parse_mm(mm) for mm in matmuls]   # 按 IR walk 顺序
+    # S6 shape 启发式: 3 连续 matmul W shape [Nq,K4]/[Nk,K4]/[Nv,K4] (Nq>Nk=Nv, GQA) = qkv
+    def kill_chain(p):
+        for op in reversed(p["kill"]):
+            if sum(1 for r in op.results for _ in r.uses) == 0:
+                try: op.erase()
+                except Exception: pass
 
-        # ---- 替换 si32 -> res_back (cast 回具体 shape), 删死链 ----
-        # 只 erase result 无 use 的 op; fill 常被多个 matmul 共享为 init buffer (uses>0),
-        # erase 有 use 的 op 会 segfault, 留给 canonicalize。
-        si32_result.replace_all_uses_with(res_back)
-        kill = [fptosi_gen, mm, uitofp_gen, transpose, collapse, broadcast_gen, sitofp_gen]
-        if fill is not None:
-            kill.append(fill)
-        for op in reversed(kill):
-            n_uses = sum(1 for r in op.results for _ in r.uses)
-            if n_uses == 0:
-                try:
-                    op.erase()
-                except Exception:
-                    pass  # 仍有隐式 use, 留给 canonicalize
+    n_call = 0; i = 0; idx = 0
+    while i < len(parsed):
+        if i + 2 < len(parsed):
+            s0, s1, s2 = parsed[i]["W_shape"], parsed[i+1]["W_shape"], parsed[i+2]["W_shape"]
+            if (len(s0) == 2 and len(s1) == 2 and len(s2) == 2 and
+                s0[1] == s1[1] == s2[1] and s0[0] > s1[0] and s1[0] == s2[0]):
+                q, k, v = parsed[i], parsed[i+1], parsed[i+2]
+                v_mm = matmuls[i+2]
+                # S6 阶段2 IR 变换 pass: q/k proj 后下游链 (si32->sitofp->RMSNorm->reshape)
+                # 在 v proj 前, qkv call result 不 dominate。收集 q/k si32 transitive use
+                # (v_mm 前), 移到 call result 后恢复 dominance。
+                movable = _collect_movable([q["si32"], k["si32"]], v_mm)
+                _p = v_mm.operation.parent
+                _blk = _p if hasattr(_p, 'operations') else _p.regions[0].blocks[0]
+                order = {o: i for i, o in enumerate(_blk.operations)}
+                with ir.InsertionPoint(v_mm):
+                    idx_const = arith_d.ConstantOp(i64_type, ir.IntegerAttr.get(i64_type, idx), loc=q["loc"])
+                    qd = tensor_d.CastOp(dyn_i8, q["X"], loc=q["loc"]).result
+                    qw = tensor_d.CastOp(dyn_i8, q["W"], loc=q["loc"]).result
+                    kd = tensor_d.CastOp(dyn_i8, k["X"], loc=k["loc"]).result
+                    kw = tensor_d.CastOp(dyn_i8, k["W"], loc=k["loc"]).result
+                    vd = tensor_d.CastOp(dyn_i8, v["X"], loc=v["loc"]).result
+                    vw = tensor_d.CastOp(dyn_i8, v["W"], loc=v["loc"]).result
+                    call = func_d.CallOp([dyn_i32, dyn_i32, dyn_i32], "cim_launch_qkv",
+                                         [idx_const.result, qd, qw, kd, kw, vd, vw], loc=q["loc"])
+                    q_res = tensor_d.CastOp(q["si32"].type, call.results[0], loc=q["loc"]).result
+                    k_res = tensor_d.CastOp(k["si32"].type, call.results[1], loc=k["loc"]).result
+                    v_res = tensor_d.CastOp(v["si32"].type, call.results[2], loc=v["loc"]).result
+                    # 按 IR 顺序移 q/k 链 op 到 v_res 后 (q_res/k_res/v_res 在前, dominate)
+                    anchor = v_res.owner
+                    for op in sorted(movable, key=lambda o: order.get(o, 0)):
+                        op.move_after(anchor)
+                        anchor = op
+                q["si32"].replace_all_uses_with(q_res)
+                k["si32"].replace_all_uses_with(k_res)
+                v["si32"].replace_all_uses_with(v_res)
+                for p in (q, k, v): kill_chain(p)
+                i += 3; idx += 1; n_call += 1; continue
+        p = parsed[i]
+        with ir.InsertionPoint(matmuls[i]):
+            idx_const = arith_d.ConstantOp(i64_type, ir.IntegerAttr.get(i64_type, idx), loc=p["loc"])
+            x_dyn = tensor_d.CastOp(dyn_i8, p["X"], loc=p["loc"]).result
+            w_dyn = tensor_d.CastOp(dyn_i8, p["W"], loc=p["loc"]).result
+            call = func_d.CallOp([dyn_i32], "cim_launch", [idx_const.result, x_dyn, w_dyn], loc=p["loc"])
+            res_back = tensor_d.CastOp(p["si32"].type, call.results[0], loc=p["loc"]).result
+        p["si32"].replace_all_uses_with(res_back)
+        kill_chain(p)
+        i += 1; idx += 1; n_call += 1
 
-    return len(matmuls)
+    return n_call
 
 
 def main():
@@ -129,6 +208,8 @@ def main():
     p.add_argument("--out", default="checkpoints/bitnet_ternary_final.mlir")
     p.add_argument("--save-linalg", default="checkpoints/bitnet_ternary_linalg.mlir",
                    help="保存 L2 中间 linalg IR (调试)")
+    p.add_argument("--partition", default="checkpoints/bitnet_ternary_partition.json",
+                   help="S6 方案B: partition.json (建 arg->bitlinear_name 识别 qkv 合并)")
     args = p.parse_args()
 
     src = open(args.inp).read()
@@ -146,7 +227,13 @@ def main():
         print(f"[L3] saved linalg intermediate: {args.save_linalg}", file=sys.stderr)
 
     print(f"[L3] 插 func.call @cim_launch_<idx> (替换 placeholder linalg.matmul)...", file=sys.stderr)
-    n = lower_linalg_to_cim_call(mod)
+    n = lower_linalg_to_cim_call(mod, args.partition)
+    with open("/tmp/l3_after_lower.mlir", "w") as f: f.write(str(mod))  # S6 debug
+    try:
+        mod.operation.verify()
+        print(f"[L3] lower 后 verify OK, n_call={n}", file=sys.stderr)
+    except Exception as e:
+        print(f"[L3] lower 后 verify FAIL: {e}", file=sys.stderr)
 
     print(f"[L3] canonicalize + cse 清死链...", file=sys.stderr)
     run_pipeline_with_repro_report(mod, "builtin.module(canonicalize, cse)", "L3 canonicalize+cse")
@@ -157,8 +244,8 @@ def main():
     with open(args.out, "w") as f:
         f.write(out)
 
-    n_call = out.count("call @cim_launch_")
-    n_decl = out.count("func.func private @cim_launch_")
+    n_call = out.count("call @cim_launch")
+    n_decl = out.count("func.func private @cim_launch")
     n_linalg_mm = out.count("linalg.matmul")
     n_linalg_gen = out.count("linalg.generic")
     n_op = out.count("torch.operator")
@@ -169,11 +256,15 @@ def main():
           file=sys.stderr)
     print(f"[L3] saved: {args.out}", file=sys.stderr)
 
+    # S6: 37 matmul -> 6 qkv 合并 (cim_launch_qkv) + 19 单 (cim_launch) = 25 call, 2 声明
+    n_qkv = out.count("call @cim_launch_qkv")
+    n_single = n_call - n_qkv
+    print(f"[L3] 其中 cim_launch_qkv={n_qkv}, cim_launch(单)={n_single}", file=sys.stderr)
     ok = True
-    if n_call != 37:
-        print(f"[L3] FAIL: call={n_call} (应=37)", file=sys.stderr); ok = False
-    if n_decl != 37:
-        print(f"[L3] FAIL: 声明={n_decl} (应=37)", file=sys.stderr); ok = False
+    if n_call != 25:
+        print(f"[L3] FAIL: call={n_call} (应=25: 6 qkv + 19 单)", file=sys.stderr); ok = False
+    if n_decl != 2:
+        print(f"[L3] FAIL: 声明={n_decl} (应=2: cim_launch + cim_launch_qkv)", file=sys.stderr); ok = False
     if n_linalg_mm != 0:
         print(f"[L3] FAIL: 残留 linalg.matmul={n_linalg_mm} (应=0, placeholder 死链未清)", file=sys.stderr); ok = False
     if n_op != 0:

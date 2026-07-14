@@ -312,6 +312,7 @@ python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n
 - **cim_main 固定宿主**：AOT `cim_main.c` 通用宿主，超参运行时从 `model_config.bin` 读（`gen_config.py` 从 .pt2 提取），forward 参数个数随 n_layer 变由 **libffi** 运行时变参调用解决，换模型不改 C 代码。
 - **PPA 架构级估算**：`ppa_config.py` 在仿真器上加活动因子统计，28nm@1GHz 估算计算耗时/功耗能效/面积（±30~50%），cim_sim 跑完 server 自动打印报告（见 `sys_sim.md` §7）。
 - **KV cache（CPU 侧，CIM 零改动）**：`inference_model.py` `RotaryMHAInference.step_stateless(h, k_in, v_in, cos, sin)` 无状态增量 forward（cache 显式 IO，cos/sin 外部传入避免动态 arange），`_KVCacheModel` 包装导出 dynamic T cache。CIM/lowering/cim_stub 零改动，O(n²)->O(n) 由 `cim_launch` 运行时 M 维 T->1（`cim_stub.c` 对 M 行循环，makespan ∝ M 行数，非 M-tile ceil(T/64)）。AOT 多输出 consume `mrf32_mrf32_mrf32`（3 个 `{i64,ptr}*` 参数，对齐 refbackend `get_ctype_func`）。实测 n=80 speedup 42x（`cost_model --kv` 量化 speedup ≈ (n+1)/2）。
+- **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（q:0-63/k:64-95/v:96-127），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` shape 启发式识别 qkv triplet（3 连续 matmul W shape [Nq>Nk=Nv] GQA）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
 
 详见 `sys_sim.md`（系统仿真运行时，JIT + AOT）+ `cim_mlp.md`（CIM 架构规范）。
 

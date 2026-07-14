@@ -280,3 +280,109 @@ Memref2D cim_launch(int64_t idx,
     }
     Memref2D r = {result, result, 0, M, N, N, 1}; return r;
 }
+
+/* S6: qkv 合并 doorbell -- 同层 q/k/v 3 个 BitLinear 合并为 1 次 doorbell (CIM 不同 Macro 并行)。
+ * q/k/v 各自 RMSNorm+quantize 致 x_int8 不同 -> 3 组 A_PAGE (a_off=[0,8,16]);
+ * 输出 Q/K/V 各自 PSUM (p_off=[0,8,12], place.py 错开)。M 循环写 3 组 A_PAGE + 1 门铃 + 读 3 组 PSUM。
+ * 多输出: struct{Memref2D Q,K,V} by value (LLVM sret, MLIR func.call 多结果 -> llvm.struct)。 */
+typedef struct { Memref2D q, k, v; } Memref2D3;
+
+static void read_psum_batch(long p_base, int32_t *dst, int64_t n_tiles, int64_t N) {
+    for (int64_t nb = 0; nb < n_tiles; nb++) {
+        int32_t acc_buf[TILE];
+        shm_read((p_base + nb) * PAGE, acc_buf, PAGE);
+        int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
+        memcpy(dst + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
+    }
+}
+
+Memref2D3 cim_launch_qkv(int64_t idx,
+    void *xqa, void *xqaa, int64_t xqoff, int64_t M, int64_t K, int64_t xqs0, int64_t xqs1,
+    void *wqa, void *wqaa, int64_t wqoff, int64_t Nq, int64_t K4q, int64_t wqs0, int64_t wqs1,
+    void *xka, void *xkaa, int64_t xkoff, int64_t M2, int64_t K2, int64_t xks0, int64_t xks1,
+    void *wka, void *wkaa, int64_t wkoff, int64_t Nk, int64_t K4k, int64_t wks0, int64_t wks1,
+    void *xva, void *xvaa, int64_t xvoff, int64_t M3, int64_t K3, int64_t xvs0, int64_t xvs1,
+    void *wva, void *wvaa, int64_t wvoff, int64_t Nv, int64_t K4v, int64_t wvs0, int64_t wvs1) {
+    (void)xqa; (void)xqs0; (void)xqs1; (void)wqa; (void)wqs0; (void)wqs1;
+    (void)xka; (void)xks0; (void)xks1; (void)wka; (void)wks0; (void)wks1; (void)M2; (void)K2;
+    (void)xva; (void)xvs0; (void)xvs1; (void)wva; (void)wvs0; (void)wvs1; (void)M3; (void)K3;
+    const int8_t *xq = (const int8_t *)((const char *)xqaa + xqoff);
+    const int8_t *xk = (const int8_t *)((const char *)xkaa + xkoff);
+    const int8_t *xv = (const int8_t *)((const char *)xvaa + xvoff);
+    const uint8_t *wq = (const uint8_t *)((const char *)wqaa + wqoff);
+    const uint8_t *wk = (const uint8_t *)((const char *)wkaa + wkoff);
+    const uint8_t *wv = (const uint8_t *)((const char *)wvaa + wvoff);
+    int64_t k_tiles = (K + TILE - 1) / TILE;
+    int64_t nq = (Nq + TILE - 1) / TILE, nk = (Nk + TILE - 1) / TILE, nv = (Nv + TILE - 1) / TILE;
+    int32_t *Q = (int32_t *)malloc((size_t)M * (size_t)Nq * sizeof(int32_t));
+    int32_t *K_ = (int32_t *)malloc((size_t)M * (size_t)Nk * sizeof(int32_t));
+    int32_t *V = (int32_t *)malloc((size_t)M * (size_t)Nv * sizeof(int32_t));
+    if (!HW_READY) {   /* fallback: 3 次 CPU matmul */
+        Memref2D rq = cim_launch_impl(xq, wq, M, K, Nq, K4q);
+        Memref2D rk = cim_launch_impl(xk, wk, M, K, Nk, K4k);
+        Memref2D rv = cim_launch_impl(xv, wv, M, K, Nv, K4v);
+        memcpy(Q, rq.allocated, (size_t)M * Nq * 4); memcpy(K_, rk.allocated, (size_t)M * Nk * 4);
+        memcpy(V, rv.allocated, (size_t)M * Nv * 4);
+        free(rq.allocated); free(rk.allocated); free(rv.allocated);
+        Memref2D3 r = {{Q,Q,0,M,Nq,Nq,1}, {K_,K_,0,M,Nk,Nk,1}, {V,V,0,M,Nv,Nv,1}}; return r;
+    }
+    int64_t n_mm = (int64_t)g_fwd_len[idx] / 6 - 1;
+    int64_t n_blk = (n_mm + SEG_MAX - 1) / SEG_MAX;
+    static const uint8_t HALT[6] = {0,0,0,0,0,0xE0};
+    if (n_blk == 1) {
+        /* S2 流水 prologue: 写 3 组 A_PAGE(0, bank0) [a_off=0/8/16] + doorbell */
+        for (int64_t kb = 0; kb < k_tiles; kb++) {
+            shm_write((long)(A_PAGE_BASE + 0 + kb) * PAGE, xq + 0*K + kb*TILE, TILE);
+            shm_write((long)(A_PAGE_BASE + 8 + kb) * PAGE, xk + 0*K + kb*TILE, TILE);
+            shm_write((long)(A_PAGE_BASE + 16 + kb) * PAGE, xv + 0*K + kb*TILE, TILE);
+        }
+        shm_write((long)INSTR_BASE * PAGE, g_fwd_base + g_fwd_off[idx], n_mm * 6);
+        shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
+        reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+        for (int64_t m = 0; m < M; m++) {
+            int64_t bn = m % 2, bn_next = (m + 1) % 2;
+            long a_base = A_PAGE_BASE + bn_next * A_BANK_OFF;
+            long p_base = PSUM_PAGE_BASE + bn * P_BANK_OFF;
+            const uint8_t *seg_next = bn_next ? g_fwd_base2 : g_fwd_base;
+            if (m + 1 < M) for (int64_t kb = 0; kb < k_tiles; kb++) {
+                shm_write((a_base + 0 + kb) * PAGE, xq + (m+1)*K + kb*TILE, TILE);
+                shm_write((a_base + 8 + kb) * PAGE, xk + (m+1)*K + kb*TILE, TILE);
+                shm_write((a_base + 16 + kb) * PAGE, xv + (m+1)*K + kb*TILE, TILE);
+            }
+            while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;
+            reg_write((long)INT_CLEAR_REG, 1);
+            if (m + 1 < M) {
+                shm_write((long)INSTR_BASE * PAGE, seg_next + g_fwd_off[idx], n_mm * 6);
+                shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
+                reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+            }
+            /* 读 3 组 PSUM(m, bn): Q(p_off=0, nq), K(p_off=8, nk), V(p_off=12, nv) */
+            read_psum_batch(p_base + 0, Q + m*Nq, nq, Nq);
+            read_psum_batch(p_base + 8, K_ + m*Nk, nk, Nk);
+            read_psum_batch(p_base + 12, V + m*Nv, nv, Nv);
+        }
+    } else {
+        /* 大段分块 (qkv 128 < 681, 一般不分块; 保留串行 fallback) */
+        for (int64_t m = 0; m < M; m++) {
+            for (int64_t kb = 0; kb < k_tiles; kb++) {
+                shm_write((long)(A_PAGE_BASE + 0 + kb) * PAGE, xq + m*K + kb*TILE, TILE);
+                shm_write((long)(A_PAGE_BASE + 8 + kb) * PAGE, xk + m*K + kb*TILE, TILE);
+                shm_write((long)(A_PAGE_BASE + 16 + kb) * PAGE, xv + m*K + kb*TILE, TILE);
+            }
+            int64_t mm_done = 0;
+            for (int64_t b = 0; b < n_blk; b++) {
+                int64_t blk_mm = (mm_done + SEG_MAX <= n_mm) ? SEG_MAX : (n_mm - mm_done);
+                shm_write((long)INSTR_BASE * PAGE, g_fwd_base + g_fwd_off[idx] + mm_done*6, blk_mm*6);
+                shm_write((long)INSTR_BASE * PAGE + blk_mm*6, (const void *)HALT, 6);
+                reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
+                while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;
+                reg_write((long)INT_CLEAR_REG, 1);
+                mm_done += blk_mm;
+            }
+            read_psum_batch(PSUM_PAGE_BASE + 0, Q + m*Nq, nq, Nq);
+            read_psum_batch(PSUM_PAGE_BASE + 8, K_ + m*Nk, nk, Nk);
+            read_psum_batch(PSUM_PAGE_BASE + 12, V + m*Nv, nv, Nv);
+        }
+    }
+    Memref2D3 r = {{Q,Q,0,M,Nq,Nq,1}, {K_,K_,0,M,Nk,Nk,1}, {V,V,0,M,Nv,Nv,1}}; return r;
+}

@@ -44,12 +44,28 @@ from classify import mark_cim_nodes, node_backend, is_cim_matmul
 @dataclass
 class CimBlock:
     idx: int
-    bitlinear_name: str       # 对应 BitLinear 路径 (从 w_packed 名解析)
-    int_mm: str               # cim.matmul op 节点名
-    w_packed: str             # w_packed placeholder 节点名
-    x_int8_in: str            # CPU->CIM 边界: 激活 int8 输入节点名
-    acc_out: str              # CIM->CPU 边界: int32 输出节点名 (cim.matmul op 本身)
+    bitlinear_name: str       # 对应 BitLinear 路径 (从 w_packed 名解析); qkv: q.proj (primary)
+    int_mm: str               # cim.matmul op 节点名; qkv: q 的
+    w_packed: str             # w_packed placeholder 节点名; qkv: q 的
+    x_int8_in: str            # CPU->CIM 边界: 激活 int8 输入节点名 (qkv: q/k/v 共享)
+    acc_out: str              # CIM->CPU 边界: int32 输出节点名; qkv: q 的
     is_kv_proj: bool = False  # S3: 是否 K/V proj (KV cache 产出者, bitlinear_name 含 k.proj/v.proj)
+    # S6: qkv 合并补充字段 (is_qkv=True 时, q 复用上面字段, k/v 用下面; x_int8_in 各自独立 -- q/k/v 各自 RMSNorm+quantize 致 x_int8 不同, A_PAGE 3 组)
+    is_qkv: bool = False
+    x_int8_in_k: str = ""
+    x_int8_in_v: str = ""
+    # S6 方案B: w_packed placeholder 在 input_specs 的 arg_number (L3 识别 qkv 用, -1=未知)
+    w_packed_arg: int = -1
+    w_packed_arg_k: int = -1
+    w_packed_arg_v: int = -1
+    bitlinear_name_k: str = ""
+    bitlinear_name_v: str = ""
+    w_packed_k: str = ""
+    w_packed_v: str = ""
+    int_mm_k: str = ""
+    int_mm_v: str = ""
+    acc_out_k: str = ""
+    acc_out_v: str = ""
 
 
 @dataclass
@@ -157,6 +173,12 @@ def partition_graph(prog) -> Partition:
 
     # [P1-4] placeholder name -> target 名映射 (target 名 m.layers.0... 更稳定, 不依赖 b_/p_ 前缀)
     ph_to_target = {}
+    ph_to_arg = {}   # S6 方案B: placeholder 名 -> graph block arg 编号 (L3 识别 qkv; 用 graph.nodes 顺序, 非 input_specs)
+    _arg_idx = 0
+    for _n in graph.nodes:           # graph placeholder 顺序 = block arg 编号 (= linalg IR %argN)
+        if _n.op == "placeholder":
+            ph_to_arg[_n.name] = _arg_idx
+            _arg_idx += 1
     for s in prog.graph_signature.input_specs:
         if s.arg is not None and s.target:
             ph_to_target[s.arg.name] = s.target
@@ -167,25 +189,70 @@ def partition_graph(prog) -> Partition:
     cim_to_cpu = []
 
     int_mms = [n for n in graph.nodes if is_cim_matmul(n)]
-    for idx, mm in enumerate(int_mms):
-        x_int8 = mm.args[0]                # CPU->CIM 边界 (激活 int8)
-        w_node = mm.args[1]                 # w_packed (custom op 直接传, 无解包链)
+    # 解析所有 int_mm 的元数据 (mm, bitlinear_name, w_packed_name, x_int8_node)
+    parsed = []
+    for mm in int_mms:
+        x_int8 = mm.args[0]
+        w_node = mm.args[1]
         w_packed = _find_w_packed(w_node)
         wp_name = w_packed.name if w_packed else "?"
-        target = ph_to_target.get(wp_name, wp_name)   # 优先 target 名 (鲁棒)
+        target = ph_to_target.get(wp_name, wp_name)
         bitlinear_name = _parse_bitlinear_name(target) if w_packed else "?"
-        # S3: 标注 K/V proj (KV cache 产出者) -- 解析后 k_proj/v_proj -> k.proj/v.proj
-        is_kv = bitlinear_name.endswith("k.proj") or bitlinear_name.endswith("v.proj")
+        parsed.append((mm, bitlinear_name, w_packed.name if w_packed else "?", x_int8))
 
+    # S6: 按 layer 分组 q/k/v triplet (layers.N.attn.{q,k,v}.proj, 共享同一 x_int8 节点) 合并为 1 cim_block
+    import re
+    used = [False] * len(parsed)
+    idx = 0
+    for i, (mm, name, wp, x_int8) in enumerate(parsed):
+        if used[i]:
+            continue
+        m = re.match(r"layers\.(\d+)\.attn\.q\.proj$", name)
+        if m:
+            layer = m.group(1)
+            ki = next((j for j in range(i + 1, len(parsed))
+                       if not used[j]
+                       and re.match(rf"layers\.{layer}\.attn\.k\.proj$", parsed[j][1])), None)
+            vi = next((j for j in range(i + 1, len(parsed))
+                       if not used[j]
+                       and re.match(rf"layers\.{layer}\.attn\.v\.proj$", parsed[j][1])), None)
+            if ki is not None and vi is not None:
+                kmm, kname, kwp, _ = parsed[ki]
+                vmm, vname, vwp, _ = parsed[vi]
+                cim_blocks.append(CimBlock(
+                    idx=idx, bitlinear_name=name, int_mm=mm.name, w_packed=wp,
+                    x_int8_in=x_int8.name, acc_out=mm.name, is_qkv=True,
+                    x_int8_in_k=kmm.args[0].name, x_int8_in_v=vmm.args[0].name,
+                    w_packed_arg=ph_to_arg.get(wp, -1),
+                    w_packed_arg_k=ph_to_arg.get(kwp, -1),
+                    w_packed_arg_v=ph_to_arg.get(vwp, -1),
+                    bitlinear_name_k=kname, w_packed_k=kwp, int_mm_k=kmm.name, acc_out_k=kmm.name,
+                    bitlinear_name_v=vname, w_packed_v=vwp, int_mm_v=vmm.name, acc_out_v=vmm.name,
+                ))
+                used[i] = used[ki] = used[vi] = True
+                idx += 1
+                # q/k/v 各自 x_int8 边界 (3 组 A_PAGE, 不共享)
+                for xx in (x_int8, kmm.args[0], vmm.args[0]):
+                    cpu_to_cim.append(Boundary(node=xx.name, direction="cpu_to_cim",
+                                               dtype=_dtype_desc(xx), shape=_shape_desc(xx)))
+                for pmm in (mm, kmm, vmm):
+                    cim_to_cpu.append(Boundary(node=pmm.name, direction="cim_to_cpu",
+                                               dtype=_dtype_desc(pmm), shape=_shape_desc(pmm)))
+                continue
+        # 非合并: 原逻辑 (o.proj / mlp / lm_head, 或 triplet 不完整)
+        is_kv = name.endswith("k.proj") or name.endswith("v.proj")
         cim_blocks.append(CimBlock(
             idx=idx,
-            bitlinear_name=bitlinear_name,
+            bitlinear_name=name,
             int_mm=mm.name,
-            w_packed=w_packed.name if w_packed else "?",
+            w_packed=wp,
             x_int8_in=x_int8.name,
             acc_out=mm.name,
             is_kv_proj=is_kv,
+            w_packed_arg=ph_to_arg.get(wp, -1),
         ))
+        used[i] = True
+        idx += 1
         cpu_to_cim.append(Boundary(
             node=x_int8.name, direction="cpu_to_cim",
             dtype=_dtype_desc(x_int8), shape=_shape_desc(x_int8),
@@ -213,6 +280,7 @@ def to_json(part: Partition, path: str) -> dict:
             "cim_nodes": len(part.cim_nodes),
             "cim_blocks": len(part.cim_blocks),
             "kv_proj": sum(1 for b in part.cim_blocks if b.is_kv_proj),
+            "qkv_group": sum(1 for b in part.cim_blocks if b.is_qkv),
         },
         "node_backend": part.node_backend,
         "cim_blocks": [asdict(b) for b in part.cim_blocks],
@@ -236,7 +304,7 @@ def main():
     part = partition_graph(prog)
     summary = to_json(part, args.out)
     print(f"[partition] CPU={summary['cpu_nodes']} CIM={summary['cim_nodes']} "
-          f"CIM块={summary['cim_blocks']} (共 {summary['total_call_function']} call_function)", file=sys.stderr)
+          f"CIM块={summary['cim_blocks']} (qkv合并={summary['qkv_group']}, 共 {summary['total_call_function']} call_function)", file=sys.stderr)
     print(f"[partition] 边界: cpu_to_cim={len(part.boundaries['cpu_to_cim'])} "
           f"cim_to_cpu={len(part.boundaries['cim_to_cpu'])}", file=sys.stderr)
     print(f"[partition] saved: {args.out}", file=sys.stderr)

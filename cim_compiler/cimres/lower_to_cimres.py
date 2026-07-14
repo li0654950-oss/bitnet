@@ -59,6 +59,45 @@ def lower_to_cimres(partition_path, weights_path, out_path):
         mod = ir.Module.create()
         with ir.InsertionPoint(mod.body):
             for blk in part["cim_blocks"]:
+                if blk.get("is_qkv"):
+                    # S6: qkv 合并 -- 1 func 含 128 matmul (q:64+k:32+v:32), k外bl内n内, dest_id bl_offset
+                    # q/k/v 各自 RMSNorm+quantize 致 x_int8 不同 -> 3 组 A_PAGE (a_page 由 place 错开)
+                    names = [blk["bitlinear_name"], blk["bitlinear_name_k"], blk["bitlinear_name_v"]]
+                    wes = [wmap[_norm(n)] for n in names]
+                    K = wes[0].K   # q/k/v 的 K 相同 (d_model=512)
+                    n_tiles_list = [math.ceil(w.N / TILE) for w in wes]   # q:8, k:4, v:4 (GQA)
+                    k_tiles = math.ceil(K / TILE)
+                    bl_offset = [0, n_tiles_list[0] * k_tiles,
+                                 (n_tiles_list[0] + n_tiles_list[1]) * k_tiles]   # [0, 64, 96]
+                    for bl, (qname, we) in enumerate(zip(names, wes)):
+                        make_tile_group(qname, we.N, we.K)
+                        for nb in range(n_tiles_list[bl]):
+                            for kb in range(k_tiles):
+                                did = total_tiles + bl_offset[bl] + nb * k_tiles + kb
+                                make_preload_weight(dest_id=did, b_page_start=0, bitlinear_name=qname)
+                    x_ty = ir.Type.parse(f"tensor<{K}xi8>", ctx)
+                    r_ty = int32_vec(ctx)
+                    func_ty = ir.FunctionType.get([x_ty] * 3, [r_ty] * 3, context=ctx)
+                    fname = "cim_" + names[0].replace(".", "_")
+                    f = func_d.FuncOp(name=fname, type=func_ty)
+                    entry = f.add_entry_block()
+                    with ir.InsertionPoint(entry):
+                        xs = entry.arguments   # 3 个 x (q/k/v, x_int8 不同)
+                        last = None
+                        # 调度: k外 bl内 n内 (q<k<v), accum 每 (bl, n_blk) 独立链
+                        for kb in range(k_tiles):
+                            for bl in range(3):
+                                for nb in range(n_tiles_list[bl]):
+                                    did = total_tiles + bl_offset[bl] + nb * k_tiles + kb
+                                    accum = kb > 0
+                                    last = make_macro_matmul(
+                                        ctx, xs[bl], dest_id=did, a_page=0, psum_page=0,
+                                        accum=accum, n_blk=nb, k_blk=kb,
+                                        bitlinear_name=names[bl])
+                        make_sync_halt()
+                        func_d.ReturnOp([last] * 3)
+                    total_tiles += sum(n * k_tiles for n in n_tiles_list)   # 64+32+32=128
+                    continue
                 name = blk["bitlinear_name"]
                 we = wmap.get(_norm(name))
                 assert we is not None, f"权重未找到: {name} (norm={_norm(name)})"

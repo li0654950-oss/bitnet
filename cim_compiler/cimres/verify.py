@@ -51,21 +51,20 @@ def _check_double_buffer_layout(mod):
     from cim_compiler.cimres.hw_config import (
         A_PAGE_BASE, A_PAGE_BANK1_BASE, PSUM_PAGE_BASE, PSUM_BANK1_BASE, INSTR_BASE)
     issues = []
-    max_k = max_n = 0
+    max_a = max_p = 0   # S6: 用实际 a_page/psum_page (qkv 错开后 max 反映真实占用)
     for func_op, _ in func_blocks(mod):
         for m in matmuls_in_func(func_op):
-            max_k = max(max_k, m["k_blk"] + 1)
-            max_n = max(max_n, m["n_blk"] + 1)
-    if max_k == 0:
+            max_a = max(max_a, m["a_page"])
+            max_p = max(max_p, m["psum_page"])
+    if max_a == 0:
         return issues
-    if A_PAGE_BASE + max_k > A_PAGE_BANK1_BASE:
-        issues.append(f"A_PAGE bank0 [0x{A_PAGE_BASE:x},0x{A_PAGE_BASE + max_k:x}) 与 bank1 "
-                      f"0x{A_PAGE_BANK1_BASE:x} 重叠 (max k_tiles={max_k})")
-    if A_PAGE_BANK1_BASE + max_k > INSTR_BASE:
-        issues.append(f"A_PAGE bank1 越界指令区 0x{INSTR_BASE:x} (max k_tiles={max_k})")
-    if PSUM_PAGE_BASE + max_n > PSUM_BANK1_BASE:
-        issues.append(f"PSUM bank0 [0x{PSUM_PAGE_BASE:x},0x{PSUM_PAGE_BASE + max_n:x}) 与 bank1 "
-                      f"0x{PSUM_BANK1_BASE:x} 重叠 (max n_tiles={max_n})")
+    a_bank_off = A_PAGE_BANK1_BASE - A_PAGE_BASE   # double buffer bank1 偏移
+    if max_a >= A_PAGE_BANK1_BASE:
+        issues.append(f"A_PAGE bank0 越界 bank1 (max a_page=0x{max_a:x} >= 0x{A_PAGE_BANK1_BASE:x})")
+    if max_a + a_bank_off >= INSTR_BASE:
+        issues.append(f"A_PAGE bank1 越界指令区 0x{INSTR_BASE:x} (max a_page=0x{max_a:x})")
+    if max_p >= PSUM_BANK1_BASE:
+        issues.append(f"PSUM bank0 越界 bank1 (max psum_page=0x{max_p:x} >= 0x{PSUM_BANK1_BASE:x})")
     return issues
 
 
@@ -101,19 +100,18 @@ def _check_func(func_op, preload_dests):
     ms = matmuls_in_func(func_op)
     if not ms:
         return issues
-    name = ms[0]["bitlinear_name"]
-
+    # S6: qkv 合并 func 含多个 bitlinear_name (q/k/v), 按 name 分组检查
     # 1. dest_id 属于 preload (每 matmul 必有对应 Macro 预载)
     for m in ms:
         if m["dest_id"] not in preload_dests:
             issues.append(
-                f"[{name}] matmul dest_id={m['dest_id']} (n={m['n_blk']},k={m['k_blk']}) 无对应 preload")
+                f"[{m['bitlinear_name']}] matmul dest_id={m['dest_id']} (n={m['n_blk']},k={m['k_blk']}) 无对应 preload")
 
-    # 2. accum 链 (per n_blk): k_blk 连续 + psum_page 同 + accum 正确
-    by_n = {}
+    # 2. accum 链 per (name, n_blk): k_blk 连续 + psum_page 同 + accum 正确
+    by_nn = {}
     for m in ms:
-        by_n.setdefault(m["n_blk"], []).append(m)
-    for n, group in by_n.items():
+        by_nn.setdefault((m["bitlinear_name"], m["n_blk"]), []).append(m)
+    for (name, n), group in by_nn.items():
         group.sort(key=lambda x: x["k_blk"])
         kblks = [m["k_blk"] for m in group]
         if kblks != list(range(len(kblks))):
@@ -127,11 +125,11 @@ def _check_func(func_op, preload_dests):
                 issues.append(
                     f"[{name}] n_blk={n} k_blk={m['k_blk']} accum={m['accum']} 应={expect}")
 
-    # 3. PAGE 并行冲突: 同 k_blk (并行批次) 不同 n_blk 的 psum_page 互不相同
-    by_k = {}
+    # 3. PAGE 并行冲突 per (name, k_blk): 同 name 同 k_blk 不同 n_blk psum_page 互不相同
+    by_nk = {}
     for m in ms:
-        by_k.setdefault(m["k_blk"], []).append(m)
-    for k, group in by_k.items():
+        by_nk.setdefault((m["bitlinear_name"], m["k_blk"]), []).append(m)
+    for (name, k), group in by_nk.items():
         owner = {}
         for m in group:
             if m["psum_page"] in owner:
@@ -141,8 +139,8 @@ def _check_func(func_op, preload_dests):
             else:
                 owner[m["psum_page"]] = m["n_blk"]
 
-    # 4. a_page 一致: 同 k_blk 的 a_page 相同 (输入页广播)
-    for k, group in by_k.items():
+    # 4. a_page 一致 per (name, k_blk): 同 name 同 k_blk a_page 同 (qkv a_page 错开, 跨 name 不同)
+    for (name, k), group in by_nk.items():
         apages = {m["a_page"] for m in group}
         if len(apages) > 1:
             issues.append(

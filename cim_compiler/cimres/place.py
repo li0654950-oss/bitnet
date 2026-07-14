@@ -59,8 +59,17 @@ def place(cimres_in, out_path):
                         continue
                     nb = int(inner.attributes["n_blk"].value)
                     kb = int(inner.attributes["k_blk"].value)
-                    inner.attributes["a_page"] = i32_attr(A_PAGE_BASE + kb)
-                    inner.attributes["psum_page"] = i32_attr(PSUM_PAGE_BASE + nb)
+                    # S6: qkv 合并 func 内 q/k/v 各自 x_int8 不同 -> a_page 错开 (3 组 A_PAGE);
+                    # PSUM_PAGE 错开 (q:0-7/k:8-11/v:12-15, 16 PAGE/层, bank0 32 PAGE 够)
+                    bl_name = str(inner.attributes["bitlinear_name"].value)
+                    if bl_name.endswith("k.proj"):
+                        a_off, p_off = 8, 8     # k: A_PAGE+8 (0x018+kb), PSUM+8 (0xC08+nb)
+                    elif bl_name.endswith("v.proj"):
+                        a_off, p_off = 16, 12    # v: A_PAGE+16 (0x020+kb), PSUM+12 (0xC0C+nb)
+                    else:
+                        a_off, p_off = 0, 0      # q + 非 qkv: 原 A_PAGE+kb, PSUM+nb
+                    inner.attributes["a_page"] = i32_attr(A_PAGE_BASE + a_off + kb)
+                    inner.attributes["psum_page"] = i32_attr(PSUM_PAGE_BASE + p_off + nb)
                     n_matmul += 1
         if max_dest >= 4096:
             raise ValueError(

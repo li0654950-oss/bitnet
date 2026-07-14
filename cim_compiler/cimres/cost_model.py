@@ -146,6 +146,54 @@ def estimate_kv(mod, n_tokens, block_size=256):
     }
 
 
+def estimate_qkv_merged(mod):
+    """S6: 评估合并同层 q/k/v 为单 doorbell 的 makespan (spec-faithful 真提升)。
+
+    每层 q/k/v 三个 BitLinear 读同一 x_int8, dest_id 不重叠 (q:0-63/k:64-95/v:96-127),
+    输出独立。合并为 1 doorbell (128 MATMUL + SYNC_HALT), CIM 内不同 Macro 天然并行 (§4.7.7)。
+    合并 makespan = 198/层 (fetch-bound: 128*T_FETCH=128 + tail T_DISPATCH+T_MATMUL+T_WB=70)
+    vs 串行 338/层 (3 doorbell: 134+102+102)。节省 140*6=840 cycle (13.4%)。
+
+    返回 {n_qkv_group, serial, merged, saved, speedup}。
+    """
+    import re
+    groups = {}   # layer -> [(proj, ms), ...]
+    for func_op, _ in func_blocks(mod):
+        ms = matmuls_in_func(func_op)
+        if not ms:
+            continue
+        name = ms[0]["bitlinear_name"]
+        m = re.match(r"layers\.(\d+)\.attn\.(q|k|v)\.proj$", name)
+        if m:
+            groups.setdefault(int(m.group(1)), []).append((m.group(2) + ".proj", ms))
+    serial_total = merged_total = 0
+    n_group = 0
+    _bl_order = {"q.proj": 0, "k.proj": 1, "v.proj": 2}
+    for layer, items in sorted(groups.items()):
+        qkv = {p: ms for p, ms in items if p in _bl_order}
+        if len(qkv) < 3:
+            continue            # 非完整 q/k/v 三件套, 跳过
+        n_group += 1
+        serial = sum(estimate_func(qkv[p]) for p in ("q.proj", "k.proj", "v.proj"))
+        # 合并: concat 3 func tile, 按 k外 bl内 n内 排序 (q<k<v)
+        merged_ms = []
+        for p in ("q.proj", "k.proj", "v.proj"):
+            for t in qkv[p]:
+                t2 = dict(t); t2["_bl"] = _bl_order[p]
+                merged_ms.append(t2)
+        merged_ms.sort(key=lambda t: (t["k_blk"], t["_bl"], t["n_blk"]))
+        merged = estimate_func(merged_ms)
+        serial_total += serial
+        merged_total += merged
+    return {
+        "n_qkv_group": n_group,
+        "serial": serial_total,
+        "merged": merged_total,
+        "saved": serial_total - merged_total,
+        "speedup": 1 - merged_total / max(serial_total, 1),
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--in", dest="inp", default="cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir")
