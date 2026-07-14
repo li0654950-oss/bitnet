@@ -57,10 +57,11 @@ def main():
     print(f"[覆盖] cpu({s['cpu_nodes']})+cim({s['cim_nodes']})={cover} == 总call_function={n_cf} "
           f"{'OK' if c1 else 'FAIL'}")
 
-    # 2. CIM 块数 == matmul 数
-    c2 = (s["cim_blocks"] == n_mm)
+    # 2. CIM 块数 == matmul 数 (S6 qkv 合并: 每 triplet 3 matmul -> 1 块, 省 2)
+    qkv = s.get("qkv_group", 0)
+    c2 = (s["cim_blocks"] + 2 * qkv == n_mm)
     ok &= c2
-    print(f"[CIM块] {s['cim_blocks']} == matmul数={n_mm} {'OK' if c2 else 'FAIL'}")
+    print(f"[CIM块] {s['cim_blocks']} 块 (+{qkv}*2 qkv合并) == matmul数={n_mm} {'OK' if c2 else 'FAIL'}")
 
     # 3. 边界数
     n_c2c = len(part["boundaries"]["cpu_to_cim"])

@@ -8,6 +8,10 @@ version = "0.1.0"
 description = "BitNet b1.58 CIM/CPU heterogeneous inference compiler"
 requires-python = ">=3.11"
 
+# 安装后命令: cim-pipeline 任意 cwd 跑全 13 步 (export -> AOT) 出全部产物
+[project.scripts]
+cim-pipeline = "cim_compiler.pipeline:main"
+
 # bitnet/ 与 cim_compiler/ 均已是包 (有 __init__.py), 装为 editable package 后
 # 全 repo 用绝对包导入 (from bitnet.model import / from cim_compiler.export.X import),
 # 取代各脚本顶部的 sys.path.insert hack。

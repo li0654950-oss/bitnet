@@ -1,0 +1,2 @@
+[console_scripts]
+cim-pipeline = cim_compiler.pipeline:main

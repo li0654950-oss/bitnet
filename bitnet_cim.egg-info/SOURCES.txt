@@ -10,6 +10,7 @@ bitnet/train_shakespeare_char.py
 bitnet_cim.egg-info/PKG-INFO
 bitnet_cim.egg-info/SOURCES.txt
 bitnet_cim.egg-info/dependency_links.txt
+bitnet_cim.egg-info/entry_points.txt
 bitnet_cim.egg-info/top_level.txt
 cim_compiler/__init__.py
 cim_compiler/gen_random_model.py

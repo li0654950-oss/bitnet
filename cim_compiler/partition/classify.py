@@ -5,15 +5,18 @@ CIM 节点 = cim.matmul custom op 节点本身 (解包/累加封装在 op 内部
 对应 cim_mlp.md 的 CIM Macro: 2bit 补码节点 + 宏内解包 + int32 累加。
 其余节点 (norm / 激活量化 / rescale / attention / embedding) 归 CPU。
 """
+import torch
 import torch.fx as fx
 
 
 def is_cim_matmul(node: fx.Node) -> bool:
     """节点是否为 CIM matmul (cim::matmul custom op)。
 
-    FX target str = "cim.matmul.default" (注册 "cim::matmul" -> torch.ops.cim.matmul)。
+    target 对象比较 (非字符串包含, 与 export verify_export 一致):
+    node.target == torch.ops.cim.matmul.default。
+    需 cim_op 已注册 -- 调用方 (partition.py / verify_partition.py) 均 import cim_op。
     """
-    return node.op == "call_function" and "cim.matmul" in str(node.target)
+    return node.op == "call_function" and node.target == torch.ops.cim.matmul.default
 
 
 def mark_cim_nodes(graph: fx.Graph) -> set:
