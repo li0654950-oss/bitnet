@@ -12,41 +12,29 @@
   python cim_compiler/export/verify_export.py --graph checkpoints/bitnet_ternary.pt2 \\
     --blob checkpoints/bitnet_ternary_weights.bin --ternary checkpoints/bitnet_shakespeare_char_ternary.pt
 """
-import os
-import sys
 import argparse
+import sys
 from collections import Counter
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
-REPO = os.path.dirname(os.path.dirname(HERE))
-BITNET = os.path.join(REPO, "bitnet")
-if BITNET not in sys.path:
-    sys.path.insert(0, BITNET)
 
 import torch
 import torch.export
 
-from inference_model import build_inference_model, BitLinearInference
-from weight_blob import read_weight_blob
-from data_char import get_meta
+from cim_compiler.export.inference_model import BitLinearInference
+from cim_compiler.export.weight_blob import read_weight_blob
+from cim_compiler.export.export_common import add_model_args, build_model_from_args
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_model_args(p)
     p.add_argument("--graph", default="checkpoints/bitnet_ternary.pt2")
     p.add_argument("--blob", default="checkpoints/bitnet_ternary_weights.bin")
-    p.add_argument("--ternary", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
-    p.add_argument("--block_size", type=int, default=256)
     args = p.parse_args()
 
     ok = True
 
-    # eager 推理模型 (参照)
-    model = build_inference_model(
-        args.ternary, vocab_size=get_meta()["vocab_size"], block_size=args.block_size,
-    )
+    # eager 推理模型 (参照, 架构参数与 export 入口同源 -- 修旧版只传 block_size 的漏传)
+    model = build_model_from_args(args)
     prog = torch.export.load(args.graph)
 
     # 1) 数值一致性: BOS (seq=1) 与变长 (seq=7)
@@ -61,8 +49,10 @@ def main():
         print(f"[数值] {tag}: export vs eager max|diff|={d:.4e} {'OK' if good else 'FAIL'}")
 
     # 2) 图节点统计 (cim.matmul op 应保留为 op 节点, 不内联成 aten.matmul)
-    n_cim = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "cim.matmul" in str(n.target))
-    n_aten_mm = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "matmul" in str(n.target) and "cim.matmul" not in str(n.target))
+    _cim_mm = torch.ops.cim.matmul.default
+    _aten_mm = torch.ops.aten.matmul.default
+    n_cim = sum(1 for n in prog.graph.nodes if n.op == "call_function" and n.target == _cim_mm)
+    n_aten_mm = sum(1 for n in prog.graph.nodes if n.op == "call_function" and n.target == _aten_mm)
     n_detach = sum(1 for n in prog.graph.nodes if "detach" in str(n.target))
     n_bl = sum(1 for m in model.modules() if isinstance(m, BitLinearInference))
     g_ok = (n_cim == n_bl and n_aten_mm == 0 and n_detach == 0)

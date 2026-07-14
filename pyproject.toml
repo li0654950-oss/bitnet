@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitnet-cim"
+version = "0.1.0"
+description = "BitNet b1.58 CIM/CPU heterogeneous inference compiler"
+requires-python = ">=3.11"
+
+# bitnet/ 与 cim_compiler/ 均已是包 (有 __init__.py), 装为 editable package 后
+# 全 repo 用绝对包导入 (from bitnet.model import / from cim_compiler.export.X import),
+# 取代各脚本顶部的 sys.path.insert hack。
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bitnet*", "cim_compiler*"]

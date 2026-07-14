@@ -15,15 +15,10 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-BITNET = os.path.join(REPO, "bitnet")
-if BITNET not in sys.path:
-    sys.path.insert(0, BITNET)
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+REPO = os.path.dirname(os.path.dirname(HERE))  # repo root (默认 checkpoint 路径用)
 
 import torch
-from inference_model import build_inference_model, generate_kv
+from cim_compiler.export.inference_model import build_inference_model, generate_kv
 
 
 @torch.no_grad()

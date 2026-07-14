@@ -11,21 +11,12 @@
 对应 cim_mlp.md 的 CIM 定点通路:
   int8 激活 × 2bit 节点 -> int32 累加 -> CPU rescale (FP32 留 CPU 侧, 不写回共享缓存)。
 """
-import os
-import sys
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-# HERE = cim_compiler/export/ ; 上两层 = repo root ; repo root/bitnet = bitnet 包
-BITNET = os.path.join(os.path.dirname(os.path.dirname(HERE)), "bitnet")
-if BITNET not in sys.path:
-    sys.path.insert(0, BITNET)
-
 import torch
 import torch.nn as nn
 
-from model import BitNet, BitLinear, RotaryMHA  # noqa: E402
-from torch.nn.functional import scaled_dot_product_attention  # noqa: E402
-import cim_op  # noqa: E402, F401  (注册 cim::matmul custom op)
+from bitnet.model import BitNet, BitLinear, RotaryMHA
+from torch.nn.functional import scaled_dot_product_attention
+from cim_compiler.export import cim_op  # noqa: F401  (注册 cim::matmul custom op)
 
 
 class BitLinearInference(nn.Module):

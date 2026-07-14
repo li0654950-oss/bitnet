@@ -8,38 +8,26 @@ _KVCacheModel.forward(idx[B,1], k_caches[L,B,T,n_kv,hd], v_caches, cos, sin)
 
 用法: python cim_compiler/export/export_kv.py
 """
-import os, sys, argparse
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-BITNET = os.path.join(REPO, "bitnet")
-if BITNET not in sys.path: sys.path.insert(0, BITNET)
-if HERE not in sys.path: sys.path.insert(0, HERE)
+import argparse
+import sys
 
 import torch
 from torch.export import Dim
-from inference_model import build_inference_model, _KVCacheModel
-import cim_op  # noqa
-from weight_blob import write_weight_blob
-from data_char import get_meta
+
+from cim_compiler.export.inference_model import _KVCacheModel
+from cim_compiler.export import cim_op  # noqa: F401  (注册 cim::matmul)
+from cim_compiler.export.weight_blob import write_weight_blob
+from cim_compiler.export.export_common import add_model_args, build_model_from_args
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ternary", default="checkpoints/bitnet_shakespeare_char_ternary.pt")
+    add_model_args(p)
     p.add_argument("--out_graph", default="checkpoints/bitnet_ternary_kv.pt2")
     p.add_argument("--out_blob", default="checkpoints/bitnet_ternary_weights.bin")
-    p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--block_size", type=int, default=256)
-    p.add_argument("--n_layer", type=int, default=6)
-    p.add_argument("--n_head", type=int, default=8)
-    p.add_argument("--n_kv_head", type=int, default=4)
-    p.add_argument("--ffn_dim", type=int, default=1664)
     args = p.parse_args()
 
-    meta = get_meta()
-    model = build_inference_model(args.ternary, vocab_size=meta["vocab_size"],
-        d_model=args.d_model, block_size=args.block_size, n_layer=args.n_layer,
-        n_head=args.n_head, n_kv_head=args.n_kv_head, ffn_dim=args.ffn_dim)
+    model = build_model_from_args(args)
     kvm = _KVCacheModel(model)
     n_layer = len(model.layers)
     attn0 = model.layers[0].attn
@@ -59,7 +47,7 @@ def main():
         dynamic_shapes=(None, {2: Dim("T", min=1, max=256)}, {2: Dim("T", min=1, max=256)}, None, None))
     torch.export.save(prog, args.out_graph)
     n_cf = sum(1 for n in prog.graph.nodes if n.op == "call_function")
-    n_cim = sum(1 for n in prog.graph.nodes if n.op == "call_function" and "cim.matmul" in str(n.target))
+    n_cim = sum(1 for n in prog.graph.nodes if n.op == "call_function" and n.target == torch.ops.cim.matmul.default)
     print(f"[export_kv] {n_cf} call_function, {n_cim} cim.matmul (decode M=1)", file=sys.stderr)
     print(f"[export_kv] saved: {args.out_graph}", file=sys.stderr)
     write_weight_blob(model, args.out_blob)
