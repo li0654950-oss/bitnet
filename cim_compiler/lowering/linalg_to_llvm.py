@@ -114,6 +114,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--in", dest="inp", default="checkpoints/bitnet_ternary_placeholder.mlir")
     p.add_argument("--out", default="checkpoints/bitnet_ternary_llvm.mlir")
+    p.add_argument("--partition", default="checkpoints/bitnet_ternary_partition.json",
+                   help="方案B: partition.json 元数据识别 qkv")
     args = p.parse_args()
 
     csl = _load_cim_stub_lower()
@@ -129,7 +131,7 @@ def main():
     _module_lowering(False, False, OutputType.LINALG_ON_TENSORS, mod)
 
     print(f"[L4] L3: 插 func.call @cim_launch + canonicalize...", file=sys.stderr)
-    n = csl.lower_linalg_to_cim_call(mod)
+    n = csl.lower_linalg_to_cim_call(mod, args.partition)
     run_pipeline_with_repro_report(mod, "builtin.module(canonicalize, cse)", "L3 canon+cse")
 
     print(f"[L4] cim_call_to_memref: {cim_call_to_memref(mod)} func.call 转 memref", file=sys.stderr)

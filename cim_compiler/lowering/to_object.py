@@ -49,6 +49,8 @@ def main():
     p.add_argument("--runtime-so", default=os.path.join(HERE, "aot", "cim_runtime.so"),
                    help="C 版 consume runtime (.so, 提供 refbackend_consume_func_return_*, AOT 用)")
     p.add_argument("--out", default="checkpoints/bitnet_ternary.o")
+    p.add_argument("--partition", default="checkpoints/bitnet_ternary_partition.json",
+                   help="方案B: partition.json 元数据识别 qkv")
     args = p.parse_args()
 
     csl = _load("cim_stub_lower", os.path.join(HERE, "cim_stub_lower.py"))
@@ -59,7 +61,7 @@ def main():
     ctx.enable_multithreading(False)
     mod = ir.Module.parse(src, ctx)
     _module_lowering(False, False, OutputType.LINALG_ON_TENSORS, mod)
-    csl.lower_linalg_to_cim_call(mod)
+    csl.lower_linalg_to_cim_call(mod, args.partition)
     run_pipeline_with_repro_report(mod, "builtin.module(canonicalize, cse)", "canon")
     ll.cim_call_to_memref(mod)
     from torch_mlir_e2e_test.linalg_on_tensors_backends import refbackend as rb

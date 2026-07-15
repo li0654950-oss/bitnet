@@ -92,6 +92,30 @@ def _collect_movable(si32_vals, v_mm):
     return movable
 
 
+def _load_partition_meta(partition_path):
+    """读 partition.json, 展开 cim_blocks 为 37 matmul 条目 (按 IR 顺序 = L3 walk 顺序)。
+
+    方案B: 用 partition.json 元数据识别 qkv, 替代 shape 启发式 (Nq>Nk=Nv)。
+    每条目 {name, is_qkv, role, blk_idx}; qkv 块展开 q/k/v 三个 (role=q/k/v),
+    非 qkv 块 role=None。顺序 = cim_blocks idx 顺序 (qkv 展开), 与 L3 walk linalg.matmul
+    顺序一致 (都按 IR 拓扑序, L1/L2 降级不改 op 顺序)。
+
+    注: partition.json 的 w_packed_arg (input_specs 顺序) 与 MLIR %argN (torch-mlir 重排)
+    不一致, 故不用 arg_number 映射, 改用 matmul 顺序映射 (IR walk 顺序 == cim_blocks 展开顺序)。
+    """
+    with open(partition_path) as f:
+        d = json.load(f)
+    entries = []
+    for b in d["cim_blocks"]:
+        if b.get("is_qkv"):
+            entries.append({"name": b["bitlinear_name"], "is_qkv": True, "role": "q", "blk_idx": b["idx"]})
+            entries.append({"name": b["bitlinear_name_k"], "is_qkv": True, "role": "k", "blk_idx": b["idx"]})
+            entries.append({"name": b["bitlinear_name_v"], "is_qkv": True, "role": "v", "blk_idx": b["idx"]})
+        else:
+            entries.append({"name": b["bitlinear_name"], "is_qkv": False, "role": None, "blk_idx": b["idx"]})
+    return entries
+
+
 def lower_linalg_to_cim_call(mod, partition_path=None) -> int:
     """把 placeholder 降级的 linalg.matmul 替换为 func.call @cim_launch / @cim_launch_qkv。
     S6 shape 启发式: 3 连续 matmul W shape [Nq>Nk=Nv] (GQA) 识别 qkv, 合并为 cim_launch_qkv。返回 call 数。"""
@@ -136,14 +160,17 @@ def lower_linalg_to_cim_call(mod, partition_path=None) -> int:
         outs_v = mm.operands[2]
         if hasattr(outs_v.owner, "name"):
             fill = outs_v.owner
-        try: W_shape = list(W_packed.type.shape)   # [N, K4] (S6 shape 启发式)
-        except Exception: W_shape = []
-        return {"X": X_si8, "W": W_packed, "W_shape": W_shape, "si32": si32_result,
+        return {"X": X_si8, "W": W_packed, "si32": si32_result,
                 "kill": [fptosi_gen, mm, uitofp_gen, transpose, collapse, broadcast_gen, sitofp_gen] + ([fill] if fill else []),
                 "loc": loc}
 
     parsed = [parse_mm(mm) for mm in matmuls]   # 按 IR walk 顺序
-    # S6 shape 启发式: 3 连续 matmul W shape [Nq,K4]/[Nk,K4]/[Nv,K4] (Nq>Nk=Nv, GQA) = qkv
+    # 方案B: 用 partition.json 元数据 (role q/k/v + 同 blk_idx) 识别 qkv (shape 启发式已移除)
+    if not partition_path:
+        raise ValueError("方案B 需要 partition_path (partition.json 元数据识别 qkv)")
+    entries = _load_partition_meta(partition_path)
+    if len(entries) != len(parsed):
+        raise ValueError(f"partition.json 展开 {len(entries)} 条目 != L3 walk {len(parsed)} matmul (顺序映射失效)")
     def kill_chain(p):
         for op in reversed(p["kill"]):
             if sum(1 for r in op.results for _ in r.uses) == 0:
@@ -152,10 +179,14 @@ def lower_linalg_to_cim_call(mod, partition_path=None) -> int:
 
     n_call = 0; i = 0; idx = 0
     while i < len(parsed):
+        # qkv triplet 判定: partition.json 元数据 (方案B, role q/k/v + 同 blk_idx)
+        is_qkv = False
         if i + 2 < len(parsed):
-            s0, s1, s2 = parsed[i]["W_shape"], parsed[i+1]["W_shape"], parsed[i+2]["W_shape"]
-            if (len(s0) == 2 and len(s1) == 2 and len(s2) == 2 and
-                s0[1] == s1[1] == s2[1] and s0[0] > s1[0] and s1[0] == s2[0]):
+            e0, e1, e2 = entries[i], entries[i+1], entries[i+2]
+            if (e0["is_qkv"] and e0["role"] == "q" and e1["role"] == "k" and e2["role"] == "v"
+                    and e0["blk_idx"] == e1["blk_idx"] == e2["blk_idx"]):
+                is_qkv = True
+        if is_qkv:
                 q, k, v = parsed[i], parsed[i+1], parsed[i+2]
                 v_mm = matmuls[i+2]
                 # S6 阶段2 IR 变换 pass: q/k proj 后下游链 (si32->sitofp->RMSNorm->reshape)

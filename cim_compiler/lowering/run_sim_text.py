@@ -73,6 +73,8 @@ def main():
                    help="int prompt 模式 (跳过 tokenizer, 直接用 token id; 合并自 generate.py)")
     p.add_argument("--num-tokens", dest="n", type=int, default=60, help="生成 token 数")
     p.add_argument("--block_size", type=int, default=256)
+    p.add_argument("--partition", default="checkpoints/bitnet_ternary_partition.json",
+                   help="方案B: partition.json 元数据识别 qkv")
     p.add_argument("--sim", action="store_true", default=True, help="用 hw_simulator MMIO 仿真")
     p.add_argument("--no-ref", action="store_true", help="跳过 PyTorch reference")
     p.add_argument("--kv", action="store_true", help="接入点③: 增量 KV cache (decode M=1, O(n²)->O(n))")
@@ -108,7 +110,7 @@ def main():
     cim_jit = _load_cim_jit()
     sys.modules["cim_jit"] = cim_jit
     print("[run] 构建 LLVM mod (in-memory L2+L3+L4)...", file=sys.stderr)
-    mod = cim_jit.build_llvm_mod(args.inp)
+    mod = cim_jit.build_llvm_mod(args.inp, args.partition)
     invoker = cim_jit.CIMInvoker(mod, args.so)
     print("[run] ExecutionEngine + cim_stub.so 就绪", file=sys.stderr)
 

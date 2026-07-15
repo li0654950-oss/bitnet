@@ -59,7 +59,7 @@ def _load(name, path):
     return m
 
 
-def build_llvm_mod(placeholder_path):
+def build_llvm_mod(placeholder_path, partition_path=None):
     csl = _load("cim_stub_lower", os.path.join(HERE, "cim_stub_lower.py"))
     ll = _load("linalg_to_llvm_mod", os.path.join(HERE, "linalg_to_llvm.py"))
     src = open(placeholder_path).read()
@@ -68,7 +68,7 @@ def build_llvm_mod(placeholder_path):
     ctx.enable_multithreading(False)
     mod = ir.Module.parse(src, ctx)
     _module_lowering(False, False, OutputType.LINALG_ON_TENSORS, mod)
-    csl.lower_linalg_to_cim_call(mod)
+    csl.lower_linalg_to_cim_call(mod, partition_path)
     run_pipeline_with_repro_report(mod, "builtin.module(canonicalize, cse)", "canon")
     ll.cim_call_to_memref(mod)
     from torch_mlir_e2e_test.linalg_on_tensors_backends import refbackend as rb
@@ -319,10 +319,12 @@ def main():
     p.add_argument("--n_head", type=int, default=8)
     p.add_argument("--n_kv_head", type=int, default=4)
     p.add_argument("--ffn_dim", type=int, default=1664)
+    p.add_argument("--partition", default="checkpoints/bitnet_ternary_partition.json",
+                   help="方案B: partition.json 元数据识别 qkv (不传则回退 shape 启发式)")
     args = p.parse_args()
 
     print("[L6] 构建 LLVM mod (in-memory L2+L3+L4)...", file=sys.stderr)
-    mod = build_llvm_mod(args.inp)
+    mod = build_llvm_mod(args.inp, args.partition)
     print("[L6] LLVM mod OK", file=sys.stderr)
 
     invoker = CIMInvoker(mod, args.so)
