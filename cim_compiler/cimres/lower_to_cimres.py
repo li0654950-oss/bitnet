@@ -93,7 +93,7 @@ def lower_to_cimres(partition_path, weights_path, out_path):
                                     last = make_macro_matmul(
                                         ctx, xs[bl], dest_id=did, a_page=0, psum_page=0,
                                         accum=accum, n_blk=nb, k_blk=kb,
-                                        bitlinear_name=names[bl])
+                                        bitlinear_name=names[bl], role=["q", "k", "v"][bl])
                         make_sync_halt()
                         func_d.ReturnOp([last] * 3)
                     total_tiles += sum(n * k_tiles for n in n_tiles_list)   # 64+32+32=128
@@ -132,7 +132,7 @@ def lower_to_cimres(partition_path, weights_path, out_path):
                             last = make_macro_matmul(
                                 ctx, x, dest_id=did, a_page=0, psum_page=0,
                                 accum=accum, n_blk=nb, k_blk=kb,
-                                bitlinear_name=name)
+                                bitlinear_name=name, role="none")
                     make_sync_halt()
                     func_d.ReturnOp([last])
 

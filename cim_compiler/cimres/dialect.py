@@ -4,7 +4,7 @@
 cimres op 对应 cim_mlp.md §1.3 MLIR 层映射 + §3 ISA:
   cimres.macro_matmul   : 映射 MACRO_MATMUL (§3.3)。1 PAGE int8 向量 × 64×64 三值权重 -> int32 部分和向量。
                           attrs: dest_id(Macro), a_page(输入页), psum_page(输出页),
-                                 accum(0=覆盖/1=累加), n_blk, k_blk, bitlinear_name
+                                 accum(0=覆盖/1=累加), n_blk, k_blk, bitlinear_name, role(q/k/v/none)
   cimres.preload_weight : 映射 MACRO_PROG_WGT (§3.2)。2bit 三值 tile 预载到 Macro。
                           attrs: dest_id, b_page_start(权重数据起始页), bitlinear_name
   cimres.sync_halt      : 映射 SYNC_HALT (§3.4)。同步屏障, 等 Macro 完成 + IRQ。
@@ -32,6 +32,7 @@ CIMRES_IRDL = r'''irdl.dialect @cimres {
     %a5 = irdl.any
     %a6 = irdl.any
     %a7 = irdl.any
+    %a8 = irdl.any
     %ta = irdl.any
     %tr = irdl.any
     irdl.attributes {
@@ -41,7 +42,8 @@ CIMRES_IRDL = r'''irdl.dialect @cimres {
       "accum" = %a4,
       "n_blk" = %a5,
       "k_blk" = %a6,
-      "bitlinear_name" = %a7
+      "bitlinear_name" = %a7,
+      "role" = %a8
     }
     irdl.operands(a:%ta)
     irdl.results(r:%tr)
@@ -108,8 +110,9 @@ def str_attr(s):
 
 # ---- op 构造 helper (须在 `with ctx:` + InsertionPoint 作用域) ----
 def make_macro_matmul(ctx, x, dest_id, a_page, psum_page, accum,
-                      n_blk, k_blk, bitlinear_name):
-    """构造 cimres.macro_matmul。x = int8 向量 value, 返回 int32 result value。"""
+                      n_blk, k_blk, bitlinear_name, role):
+    """构造 cimres.macro_matmul。x = int8 向量 value, 返回 int32 result value。
+    role: "q"/"k"/"v" (qkv 合并 func 内) 或 "none" (普通 BitLinear), C2 place 据此错开 PAGE。"""
     op = ir.Operation.create(
         "cimres.macro_matmul",
         results=[int32_vec(ctx)], operands=[x],
@@ -121,6 +124,7 @@ def make_macro_matmul(ctx, x, dest_id, a_page, psum_page, accum,
             "n_blk": i32_attr(n_blk),
             "k_blk": i32_attr(k_blk),
             "bitlinear_name": str_attr(bitlinear_name),
+            "role": str_attr(role),
         },
     )
     return op.result
@@ -193,11 +197,11 @@ def _self_test():
                 y0 = make_macro_matmul(ctx, x, dest_id=0, a_page=0x010,
                                        psum_page=0xC00, accum=False,
                                        n_blk=0, k_blk=0,
-                                       bitlinear_name="layers.0.attn.q.proj")
+                                       bitlinear_name="layers.0.attn.q.proj", role="q")
                 y1 = make_macro_matmul(ctx, x, dest_id=1, a_page=0x011,
                                        psum_page=0xC00, accum=True,
                                        n_blk=0, k_blk=1,
-                                       bitlinear_name="layers.0.attn.q.proj")
+                                       bitlinear_name="layers.0.attn.q.proj", role="q")
                 make_sync_halt()
                 func_d.ReturnOp([y1])
 
