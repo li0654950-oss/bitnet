@@ -39,23 +39,10 @@ import torch  # noqa: E402
 import torch.export  # noqa: E402
 import cim_op  # noqa: E402,F401  (注册 cim::matmul, 反序列化 .pt2 需要)
 from data_char import CharTokenizer  # noqa: E402
+from cim_compiler.lowering.buffer_kind import (  # noqa: E402
+    classify_buffer, KIND_INVFREQ, KIND_CAUSAL_MASK, KIND_W_PACKED, KIND_LMHEAD, KIND_NAME)
 
 MC_MAGIC = b"CIMC"
-KIND_INVFREQ, KIND_CAUSAL_MASK, KIND_W_PACKED, KIND_LMHEAD = 0, 1, 2, 3
-_KIND_NAME = {0: "inv_freq", 1: "causal_mask", 2: "w_packed", 3: "lmhead_w"}
-
-
-def classify(target):
-    """按 target 后缀定 buffer kind (与 cim_jit.build_inputs 一致)。"""
-    if "inv_freq" in target:
-        return KIND_INVFREQ
-    if "causal_mask" in target:
-        return KIND_CAUSAL_MASK
-    if "lm_head" in target and target.endswith("w_packed"):
-        return KIND_LMHEAD
-    if target.endswith("w_packed"):
-        return KIND_W_PACKED
-    raise ValueError(f"未知 buffer target: {target}")
 
 
 def extract(pt2_path, kv=False):
@@ -84,7 +71,7 @@ def extract(pt2_path, kv=False):
             continue
         # BUFFER
         shape = ph_shape.get(s.arg.name, [])
-        buffers.append((classify(s.target), len(shape), shape))
+        buffers.append((classify_buffer(s.target), len(shape), shape))
 
     if not ui_shapes:
         raise ValueError(".pt2 无 USER_INPUT")
@@ -172,7 +159,7 @@ def main():
           f"block_size={block_size} head_dim={head_dim} n_kv={n_kv}", file=sys.stderr)
     print(f"  buffers:", file=sys.stderr)
     for i, (kind, rank, shape) in enumerate(buffers):
-        print(f"    [{i:2d}] {_KIND_NAME[kind]:14s} shape={shape}", file=sys.stderr)
+        print(f"    [{i:2d}] {KIND_NAME[kind]:14s} shape={shape}", file=sys.stderr)
     print(f"[gen_config] saved: {args.out} ({len(data)} 字节)", file=sys.stderr)
 
 

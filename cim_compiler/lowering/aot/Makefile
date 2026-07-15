@@ -94,13 +94,13 @@ $(KV_CONFIG): $(ROOT)/checkpoints/bitnet_ternary_kv.pt2 $(HERE)/gen_config.py
 run: $(SIM) $(CONFIG)
 	cd $(ROOT) && $(PY) cim_compiler/lowering/aot/cim_sim_server.py --socket $(SOCK) & SRV=$$!; \
 	until [ -S $(SOCK) ]; do sleep 0.2; done; sleep 1 && cd $(ROOT) && ./cim_compiler/lowering/aot/$(SIM) --socket $(SOCK) --n 3; \
-	kill $$SRV 2>/dev/null; wait $$SRV 2>/dev/null
+	rc=$$?; kill $$SRV 2>/dev/null; wait $$SRV 2>/dev/null; exit $$rc
 
 # 增量 KV: 启动 server + 跑 cim_sim_kv --kv (O(n²)->O(n) decode M=1)
 run_kv: $(KV_SIM) $(KV_CONFIG)
 	cd $(ROOT) && $(PY) cim_compiler/lowering/aot/cim_sim_server.py --socket $(SOCK) & SRV=$$!; \
 	until [ -S $(SOCK) ]; do sleep 0.2; done; sleep 1 && cd $(ROOT) && ./cim_compiler/lowering/aot/$(KV_SIM) --socket $(SOCK) --kv --n 3; \
-	kill $$SRV 2>/dev/null; wait $$SRV 2>/dev/null
+	rc=$$?; kill $$SRV 2>/dev/null; wait $$SRV 2>/dev/null; exit $$rc
 
 clean:
 	rm -f $(STUB_O) $(RUNTIME_O) $(IPC_O) $(SHM_O) $(MAIN_O) $(RUNTIME_SO) $(SIM) $(KV_SIM)

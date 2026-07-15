@@ -56,6 +56,18 @@ def _load_cim_stub_lower():
     return m
 
 
+def _to_memref(ty):
+    """ranked tensor<T> -> memref<T>; 非 tensor (i64 标量等) 原样返回。
+
+    结构化替代 str(type).replace("tensor","memref"): 用 RankedTensorType.shape +
+    MemRefType.get, 避开 IR 类型文本替换 (C 类: 唯一可结构化的文本匹配)。
+    """
+    if isinstance(ty, ir.RankedTensorType):
+        r = ir.RankedTensorType(ty)
+        return ir.MemRefType.get(r.shape, r.element_type)
+    return ty
+
+
 def cim_call_to_memref(mod):
     """@cim_launch FuncOp signature tensor->memref + func.call 加 to_buffer/to_tensor cast。
 
@@ -75,7 +87,7 @@ def cim_call_to_memref(mod):
 
     mod.operation.walk(find)
 
-    with ctx:
+    with ctx, ir.Location.unknown(ctx):
         # declaration: tensor -> memref
         for f in list(mod.body):
             na = f.attributes.get("sym_name")
@@ -83,27 +95,28 @@ def cim_call_to_memref(mod):
                 continue
             nm = str(na).strip('"')
             if "cim_launch" in nm:
-                new_ft = ir.Type.parse(
-                    str(f.attributes["function_type"].value).replace("tensor", "memref"), ctx)
+                ft = ir.FunctionType(f.attributes["function_type"].value)
+                new_ft = ir.FunctionType.get(
+                    inputs=[_to_memref(x) for x in ft.inputs],
+                    results=[_to_memref(x) for x in ft.results], context=ctx)
                 f.attributes["function_type"] = ir.TypeAttr.get(new_ft)
         # func.call: args to_buffer, result to_tensor {restrict}
         for call in calls:
             loc = call.location
             ca = call.attributes["callee"]
             callee = ca.value if hasattr(ca, "value") else str(ca).strip('"')
-            oat = [str(o.type) for o in call.operands]
-            ort = [str(r.type) for r in call.results]
             with ir.InsertionPoint(call):
                 ba = []
-                for o, at in zip(call.operands, oat):
-                    if "tensor" in at:
-                        ba.append(buf_d.ToBufferOp(ir.Type.parse(at.replace("tensor", "memref"), ctx), o, loc=loc).results[0])
+                for o in call.operands:
+                    ot = o.type
+                    if isinstance(ot, ir.RankedTensorType):
+                        ba.append(buf_d.ToBufferOp(_to_memref(ot), o, loc=loc).results[0])
                     else:
                         ba.append(o)  # [A1] i64 idx 等标量直接传, 不 to_buffer
-                mrt = [ir.Type.parse(rt.replace("tensor", "memref"), ctx) for rt in ort]
+                mrt = [_to_memref(r.type) for r in call.results]
                 nc = func_d.CallOp(mrt, callee, ba, loc=loc)
-                tr = [buf_d.ToTensorOp(ir.Type.parse(rt, ctx), mr, restrict=True, loc=loc).results[0]
-                      for mr, rt in zip(nc.results, ort)]
+                tr = [buf_d.ToTensorOp(r.type, mr, restrict=True, loc=loc).results[0]
+                      for mr, r in zip(nc.results, call.results)]
             for old, new in zip(call.results, tr):
                 old.replace_all_uses_with(new)
             call.erase()

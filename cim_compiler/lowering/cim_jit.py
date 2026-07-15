@@ -42,6 +42,8 @@ from torch_mlir.fx import _module_lowering
 from torch_mlir.compiler_utils import OutputType, run_pipeline_with_repro_report
 from torch_mlir.execution_engine import ExecutionEngine
 from torch_mlir.runtime import unranked_memref_to_numpy, get_unranked_memref_descriptor, UnrankedMemRefDescriptor
+from cim_compiler.lowering.buffer_kind import (
+    classify_buffer, KIND_W_PACKED, KIND_LMHEAD, KIND_INVFREQ, KIND_CAUSAL_MASK)
 
 # refbackend return callback 类型映射 (复制自 refbackend.py)
 CONSUME_PREFIX = "refbackend_consume_func_return_"
@@ -199,15 +201,16 @@ def build_inputs(model, idx, exported_program=None):
         if kind == 'USER_INPUT':
             args.append(np.ascontiguousarray(idx.numpy()))
             continue
-        # BUFFER: target 名解析 model 属性, 按后缀定类型
+        # BUFFER: target 名解析 model 属性, classify_buffer 分类 kind 定类型
         t = s.target
         val = _resolve_attr(model, t)
         val = val.numpy() if hasattr(val, 'numpy') else np.asarray(val)
-        if t.endswith('w_packed'):
-            args.append(np.ascontiguousarray(val).view(np.int8))   # uint8 -> i8
-        elif 'inv_freq' in t:
+        kind = classify_buffer(t)
+        if kind in (KIND_W_PACKED, KIND_LMHEAD):    # w_packed (含 lm_head) uint8 -> i8 view
+            args.append(np.ascontiguousarray(val).view(np.int8))
+        elif kind == KIND_INVFREQ:
             args.append(val.astype(np.float32))
-        elif 'causal_mask' in t:
+        elif kind == KIND_CAUSAL_MASK:
             args.append(val.astype(np.bool_))
         else:
             args.append(np.ascontiguousarray(val))
@@ -243,11 +246,12 @@ def build_inputs_kv(model, idx, k_caches, v_caches, cos, sin, exported_program=N
         t = s.target
         val = _resolve_attr(model, t)
         val = val.numpy() if hasattr(val, 'numpy') else np.asarray(val)
-        if t.endswith('w_packed'):
+        kind = classify_buffer(t)
+        if kind in (KIND_W_PACKED, KIND_LMHEAD):
             args.append(np.ascontiguousarray(val).view(np.int8))
-        elif 'inv_freq' in t:
+        elif kind == KIND_INVFREQ:
             args.append(val.astype(np.float32))
-        elif 'causal_mask' in t:
+        elif kind == KIND_CAUSAL_MASK:
             args.append(val.astype(np.bool_))
         else:
             args.append(np.ascontiguousarray(val))
