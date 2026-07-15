@@ -32,6 +32,10 @@ KV_CONFIG = $(ROOT)/cim_compiler/cimres/checkpoints/model_config_kv.bin
 
 all: $(SIM) $(CONFIG) $(KV_SIM) $(KV_CONFIG)
 
+# nv/kv: 各自独立 target (非 KV 不依赖 KV 产物, 反之亦然); pipeline 默认用 nv, --kv 用 kv
+nv: $(SIM) $(CONFIG)
+kv: $(KV_SIM) $(KV_CONFIG)
+
 # 1. cim_runtime.so (C 版 consume ciface, to_object.py dump .o 要求 symbol resolved)
 $(RUNTIME_SO): cim_runtime.c cim_runtime.h
 	$(CC) -shared $(CFLAGS) -o $@ cim_runtime.c

@@ -137,7 +137,8 @@ python bitnet/export_ternary.py
 python bitnet/generate_shakespeare_char.py --ternary --prompt "ROMEO:" --max_tokens 128 --seed 0
 
 # 6. CIM 编译前端 + 系统仿真（见下方 cim_compiler）
-python cim_compiler/pipeline.py                    # 一键流水线 (9 步: export->...->JIT 验证 + AOT 构建)
+python cim_compiler/pipeline.py                    # 一键流水线 (12 步: export->...->JIT 验证 + AOT, 非 KV)
+python cim_compiler/pipeline.py --kv               # KV 流水线 (export_kv->...->cim_sim_kv, 跳过 cim_jit)
 python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 60          # JIT 文本生成仿真
 python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv     # JIT KV cache 增量 (O(n²)->O(n))
 ./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60                        # AOT 全序列系统仿真
@@ -197,6 +198,7 @@ cim_compiler/
 ├── lowering/            # MLIR -> LLVM + 系统仿真驱动
 │   ├── cim_stub.c          # 固定硬件驱动 (MMIO, 单一 cim_launch(idx), 一次编译任意规模复用)
 │   ├── hw_config.h         # ASIC 硬件参数 (C, 与 hw_config.py 镜像)
+│   ├── buffer_kind.py      # BUFFER target -> kind 分类 (cim_jit build_inputs + gen_config 共用, B 类去重)
 │   ├── cim_jit.py          # JIT 系统仿真 (ExecutionEngine + ctypes 回调, L6)
 │   ├── run_sim_text.py     # JIT 文本生成仿真
 │   ├── to_object.py        # AOT: dump .o (L7)
@@ -206,22 +208,25 @@ cim_compiler/
 │       ├── cim_sim_server.py                        # Python 仿真器 IPC server (跑完打印 PPA)
 │       ├── Makefile / run_aot.sh / run_aot_kv.sh    # 构建 / 全序列一键 / KV 增量一键
 │       └── tokenizer_data.h                         # CharTokenizer C 化数据 (旧, cim_main 改用 model_config)
-└── pipeline.py          # 一键流水线 (9 步, 任意规模自动适配)
+└── pipeline.py          # 一键流水线 (12 步, 任意规模自动适配; --kv 增量 KV 流程)
 ```
 
-### 编译流程（9 步，`pipeline.py`）
+### 编译流程（12 步，`pipeline.py`；`--kv` 走 KV 路径，跳过 step 11）
 
 | 步 | 阶段 | 产物 |
 |---|---|---|
-| 1 | export_fx | `.pt2` + `weights.bin` |
+| 1 | export_fx / export_kv（`--kv`）| `.pt2` + `weights.bin` |
 | 2 | L0 to_mlir | mlir |
-| 3 | partition | `partition.json`（37 CIM 块）|
-| 4 | C1 lower_to_cimres | cimres IR |
-| 5 | C2 place | placed IR（容量校验 ≤4096 Macro）|
-| 6 | C3 emit_instr | `forward.bin` + `preload.bin` |
-| 7 | L1 cim_lowering | `placeholder.mlir`（含 `func.call @cim_launch`）|
-| 8 | cim_jit --sim | JIT 数值验证（max_diff=0）|
-| 9 | AOT 构建 | `cim_sim` 可执行文件 |
+| 3 | partition | `partition.json`（25 CIM 块，qkv 合并）|
+| 4 | C1 lower_to_cimres | cimres IR（tile 展开 + role 元数据）|
+| 5 | cimres passes | canon + cse（逻辑层冗余消除）|
+| 6 | C2 place | placed IR（容量校验 ≤4096 Macro，PAGE 布局）|
+| 7 | verify | 结构校验（dest_id/accum/PAGE/a_page）|
+| 8 | 调度分析 + autotuner | cost_model/scheduler/page_alloc + S4 布局搜索 |
+| 9 | C3 emit_instr | `forward.bin` + `preload.bin`（`--kv` 用 `_kv` 后缀）|
+| 10 | L1 cim_lowering | `placeholder.mlir`（含 `func.call @cim_launch`）|
+| 11 | cim_jit --sim | JIT 数值验证（max_diff=0；`--kv` 跳过，经 make run_kv 验证）|
+| 12 | AOT 构建 | `cim_sim` / `cim_sim_kv`（`make nv` / `make kv`）|
 
 ### 系统仿真（两种模式 × 全序列/KV cache，共用 `cim_stub.c` + `HwCimSimulator`）
 
@@ -237,9 +242,10 @@ cim_compiler/
 # 0. 环境
 conda activate nanogpt-gpu   # 或直接 /home/li/anaconda3/envs/nanogpt-gpu/bin/python ...
 
-# === 一键流水线 (9 步: export -> ... -> JIT 验证 + AOT 构建) ===
-python cim_compiler/pipeline.py                              # 默认 shakespeare (6层512维)
-python cim_compiler/pipeline.py --start-step 9               # 只跑 AOT 构建 (调试)
+# === 一键流水线 (12 步: export -> ... -> JIT 验证 + AOT; 非 KV + KV 两条独立) ===
+python cim_compiler/pipeline.py                              # 非 KV 全流程 (export_fx -> cim_sim, make nv)
+python cim_compiler/pipeline.py --kv                         # KV 流程 (export_kv -> cim_sim_kv, make kv, 跳过 cim_jit)
+python cim_compiler/pipeline.py --start-step 12              # 只跑 AOT 构建 (调试)
 python cim_compiler/pipeline.py --no-sim                     # 跳过 JIT 仿真
 
 # === 多规模回归 (任意规模 ≤4096 Macro, 随机权重验证编译兼容) ===
@@ -254,7 +260,9 @@ python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 -
 python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv --temperature 0.8 --top_k 40 --seed 0
 
 # === AOT 系统仿真 (CPU 可执行文件 + IPC 仿真器, 跨进程) ===
-make -C cim_compiler/lowering/aot                                          # 构建 cim_sim + cim_sim_kv (-lffi)
+make -C cim_compiler/lowering/aot nv                       # 构建 cim_sim (非 KV only, 不依赖 KV 产物)
+make -C cim_compiler/lowering/aot kv                       # 构建 cim_sim_kv (KV only)
+make -C cim_compiler/lowering/aot                          # 构建 cim_sim + cim_sim_kv (all = nv + kv, 需两者产物就绪)
 ./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60           # 全序列一键 (nohup server + cim_sim + kill)
 ./cim_compiler/lowering/aot/run_aot_kv.sh --prompt "ROMEO:" --n 80        # KV cache 增量一键 (cim_sim_kv --kv)
 # AOT 采样 (默认 greedy; 加 --temperature >0 启用 C 侧 softmax+top_k+multinomial; srand(seed+1) 避 glibc srand(0)==srand(1) 陷阱, 不同 seed 不同输出):
@@ -289,9 +297,9 @@ python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n
 |---|---|
 | `checkpoints/bitnet_ternary.pt2` | FX graph（37 cim.matmul，动态 seq len）|
 | `checkpoints/bitnet_ternary_weights.bin` | CIM preload 权重 blob（37 层 2bit 打包）|
-| `checkpoints/bitnet_ternary_partition.json` | CPU/CIM 划分（37 CIM 块 + 边界张量）|
+| `checkpoints/bitnet_ternary_partition.json` | CPU/CIM 划分（25 cim_blocks，qkv 合并 + 边界张量）|
 | `checkpoints/bitnet_ternary_placeholder.mlir` | L1 降级产物（含 `func.call @cim_launch`）|
-| `cim_compiler/cimres/checkpoints/forward.bin` | CIMF：37 段 MATMUL 指令流（按 idx 索引）|
+| `cim_compiler/cimres/checkpoints/forward.bin` | CIMF：25 段 MATMUL 指令流（qkv 合并后，按 idx 索引）|
 | `cim_compiler/cimres/checkpoints/preload.bin` | CIMP：自包含 Preload（tile 数据 + PROG_WGT）|
 | `cim_compiler/cimres/checkpoints/model_config.bin` | CIMC：运行时模型配置（超参+buffer描述+tokenizer, cim_main 固定宿主读）|
 | `cim_compiler/lowering/cim_stub.so` | 固定硬件驱动（MMIO，任意规模复用）|
@@ -312,7 +320,7 @@ python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n
 - **cim_main 固定宿主**：AOT `cim_main.c` 通用宿主，超参运行时从 `model_config.bin` 读（`gen_config.py` 从 .pt2 提取），forward 参数个数随 n_layer 变由 **libffi** 运行时变参调用解决，换模型不改 C 代码。
 - **PPA 架构级估算**：`ppa_config.py` 在仿真器上加活动因子统计，28nm@1GHz 估算计算耗时/功耗能效/面积（±30~50%），cim_sim 跑完 server 自动打印报告（见 `sys_sim.md` §7）。
 - **KV cache（CPU 侧，CIM 零改动）**：`inference_model.py` `RotaryMHAInference.step_stateless(h, k_in, v_in, cos, sin)` 无状态增量 forward（cache 显式 IO，cos/sin 外部传入避免动态 arange），`_KVCacheModel` 包装导出 dynamic T cache。CIM/lowering/cim_stub 零改动，O(n²)->O(n) 由 `cim_launch` 运行时 M 维 T->1（`cim_stub.c` 对 M 行循环，makespan ∝ M 行数，非 M-tile ceil(T/64)）。AOT 多输出 consume `mrf32_mrf32_mrf32`（3 个 `{i64,ptr}*` 参数，对齐 refbackend `get_ctype_func`）。实测 n=80 speedup 42x（`cost_model --kv` 量化 speedup ≈ (n+1)/2）。
-- **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（q:0-63/k:64-95/v:96-127），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` shape 启发式识别 qkv triplet（3 连续 matmul W shape [Nq>Nk=Nv] GQA）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
+- **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（q:0-63/k:64-95/v:96-127），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` 用 partition.json 元数据识别 qkv（方案 B: role q/k/v + 同 blk_idx, IR walk 顺序 == cim_blocks 展开顺序; 替代旧 shape 启发式 [Nq>Nk=Nv]）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
 
 详见 `sys_sim.md`（系统仿真运行时，JIT + AOT）+ `cim_mlp.md`（CIM 架构规范）。
 
@@ -337,7 +345,7 @@ cim_compiler/                   # CIM 异构编译前端 + 系统仿真
   cimres/                       # CIM 资源映射 + 指令流 + hw_simulator (C1/C2/C3)
   lowering/                     # MLIR->LLVM + cim_stub 驱动 + JIT/AOT 系统仿真
     └── aot/                    # AOT 可执行文件 cim_sim + IPC server
-  pipeline.py                   # 一键流水线 (9 步, 任意规模自动适配)
+  pipeline.py                   # 一键流水线 (12 步, 任意规模自动适配; --kv 增量 KV 流程)
 cim_model/                      # CIM 定点仿真模型 (早期, 验证 cim_mlp.md 计算通路)
 sys_sim.md                      # 系统仿真运行时 (JIT + AOT 两种模式)
 cim_mlp.md                      # CIM 协处理器架构规范

@@ -42,18 +42,22 @@ def main():
     p.add_argument("--ffn_dim", type=int, default=1664)
     p.add_argument("--T", type=int, default=8, help="JIT 验证 seq len")
     p.add_argument("--no-sim", action="store_true", help="跳过 --sim (用 cim_stub CPU fallback)")
+    p.add_argument("--kv", action="store_true", help="增量 KV cache 流程 (export_kv -> cim_sim_kv, 跳过 cim_jit)")
     p.add_argument("--start-step", type=int, default=1, help="从第几步开始 (1-12, 调试用)")
     args = p.parse_args()
     py = args.python
 
-    # 文件路径 (相对 REPO, 各脚本默认路径一致)
-    pt2 = "checkpoints/bitnet_ternary.pt2"
+    # 文件路径 (相对 REPO; --kv 用 bitnet_ternary_kv 前缀, weights 共享)
+    prefix = "bitnet_ternary_kv" if args.kv else "bitnet_ternary"
+    pt2 = f"checkpoints/{prefix}.pt2"
     weights = "checkpoints/bitnet_ternary_weights.bin"
-    partition = "checkpoints/bitnet_ternary_partition.json"
-    cimres = "cim_compiler/cimres/checkpoints/bitnet_ternary_cimres.mlir"
-    placed = "cim_compiler/cimres/checkpoints/bitnet_ternary_cimres_placed.mlir"
-    mlir0 = "checkpoints/bitnet_ternary.mlir"
-    placeholder = "checkpoints/bitnet_ternary_placeholder.mlir"
+    partition = f"checkpoints/{prefix}_partition.json"
+    cimres = f"cim_compiler/cimres/checkpoints/{prefix}_cimres.mlir"
+    placed = f"cim_compiler/cimres/checkpoints/{prefix}_cimres_placed.mlir"
+    mlir0 = f"checkpoints/{prefix}.mlir"
+    placeholder = f"checkpoints/{prefix}_placeholder.mlir"
+    forward = f"cim_compiler/cimres/checkpoints/forward{'_kv' if args.kv else ''}.bin"
+    preload = f"cim_compiler/cimres/checkpoints/preload{'_kv' if args.kv else ''}.bin"
     so = "cim_compiler/lowering/cim_stub.so"
 
     # [A1] cim_stub.so 固定驱动 (一次编译, 任意规模复用); 不存在则编译
@@ -63,9 +67,12 @@ def main():
         print("[pipeline] 编译 cim_stub.so (固定驱动, 任意规模复用)", file=sys.stderr)
 
     steps = []
-    # 1. export_fx: ternary.pt -> .pt2 + weights.bin (vocab 从 meta.pkl 读)
-    steps.append(("1. export_fx (ternary -> .pt2 + weights.bin)", [
-        "cim_compiler/export/export_fx.py", "--ternary", args.ternary,
+    # 1. export: ternary.pt -> .pt2 + weights.bin (--kv 用 export_kv 增量 KV cache decode)
+    export_script = "cim_compiler/export/export_kv.py" if args.kv else "cim_compiler/export/export_fx.py"
+    export_name = ("1. export_kv (ternary -> kv.pt2 + weights, 增量 KV cache)"
+                   if args.kv else "1. export_fx (ternary -> .pt2 + weights.bin)")
+    steps.append((export_name, [
+        export_script, "--ternary", args.ternary,
         "--out_graph", pt2, "--out_blob", weights,
         "--d_model", str(args.d_model), "--block_size", str(args.block_size),
         "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
@@ -98,26 +105,32 @@ def main():
         "cim_compiler/cimres/autotuner.py", "--in", placed, "--rout", "1"]))
     # 9. C3 emit_instr: placed.mlir + weights.bin -> forward.bin + preload.bin (容量校验)
     steps.append(("9. C3 emit_instr (placed+weights -> forward/preload, 容量校验)", [
-        "cim_compiler/cimres/emit_instr.py"]))
+        "cim_compiler/cimres/emit_instr.py",
+        "--in", placed, "--weights", weights,
+        "--preload", preload, "--forward", forward]))
     # 10. L1 cim_lowering: bitnet_ternary.mlir -> placeholder.mlir
     steps.append(("10. L1 cim_lowering (mlir -> placeholder)", [
         "cim_compiler/lowering/cim_lowering.py", "--in", mlir0, "--out", placeholder]))
     # 11. cim_jit --sim: JIT + 数值验证 (max_diff=0)  [A1] .so 固定, 不再 gen_cim_stub
-    sim_flag = [] if args.no_sim else ["--sim"]
-    steps.append(("11. cim_jit (JIT + 数值验证)", [
-        "cim_compiler/lowering/cim_jit.py",
-        "--in", placeholder, "--ternary", args.ternary, "--so", so,
-        "--T", str(args.T),
-        "--vocab_size", str(args.vocab_size),
-        "--d_model", str(args.d_model), "--block_size", str(args.block_size),
-        "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
-        "--n_kv_head", str(args.n_kv_head), "--ffn_dim", str(args.ffn_dim),
-    ] + sim_flag))
-    # 12. AOT 构建: to_object + make -> cim_sim + model_config.bin (cim_compiler/lowering/aot/)
-    #    make 依赖链自动: gen_config (.pt2 -> model_config.bin) + 链接 cim_sim (-lffi 运行时变参)
+    #    --kv 跳过: cim_jit 用 build_inputs (非 KV), KV 数值验证经 make run_kv (AOT cim_sim_kv)
+    if not args.kv:
+        sim_flag = [] if args.no_sim else ["--sim"]
+        steps.append(("11. cim_jit (JIT + 数值验证)", [
+            "cim_compiler/lowering/cim_jit.py",
+            "--in", placeholder, "--ternary", args.ternary, "--so", so,
+            "--T", str(args.T),
+            "--vocab_size", str(args.vocab_size),
+            "--d_model", str(args.d_model), "--block_size", str(args.block_size),
+            "--n_layer", str(args.n_layer), "--n_head", str(args.n_head),
+            "--n_kv_head", str(args.n_kv_head), "--ffn_dim", str(args.ffn_dim),
+        ] + sim_flag))
+    # 12. AOT 构建: to_object + make -> cim_sim(_kv) + model_config(_kv).bin
+    #    make nv/kv target 各自独立 (非 KV 不依赖 KV 产物, 反之亦然); all = nv + kv
     #    cim_main.c 固定通用宿主, 任意模型规模复用 (超参运行时从 model_config.bin 读)
-    steps.append(("12. AOT 构建 (to_object + make -> cim_sim + model_config.bin)", [
-        "make", "-C", "cim_compiler/lowering/aot"]))
+    make_target = "kv" if args.kv else "nv"
+    aot_name = ("12. AOT 构建 (make kv -> cim_sim_kv + model_config_kv.bin)"
+                if args.kv else "12. AOT 构建 (make nv -> cim_sim + model_config.bin)")
+    steps.append((aot_name, ["make", "-C", "cim_compiler/lowering/aot", make_target]))
 
     for i, (name, cmd) in enumerate(steps, 1):
         if i < args.start_step:
