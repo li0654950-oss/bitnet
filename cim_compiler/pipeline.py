@@ -100,9 +100,6 @@ def main():
     # 8. 调度分析: cost_model + scheduler + page_alloc (S1, makespan/最优性/PAGE 报告, 不改产物)
     steps.append(("8. 调度分析 (cost_model+scheduler+page_alloc, S1)", [
         "cim_compiler/cimres/run_sched_analysis.py", "--in", placed]))
-    # 8b. autotuner: S4 布局搜索 (macro_layout 策略 + cost_model 评估, 报告最优布局 + makespan 降)
-    steps.append(("8b. autotuner (S4 布局搜索, 报告最优)", [
-        "cim_compiler/cimres/autotuner.py", "--in", placed, "--rout", "1"]))
     # 9. C3 emit_instr: placed.mlir + weights.bin -> forward.bin + preload.bin (容量校验)
     steps.append(("9. C3 emit_instr (placed+weights -> forward/preload, 容量校验)", [
         "cim_compiler/cimres/emit_instr.py",

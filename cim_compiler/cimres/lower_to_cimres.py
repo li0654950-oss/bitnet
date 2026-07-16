@@ -35,9 +35,8 @@ from cim_compiler.cimres.dialect import (
     register_cimres, make_macro_matmul, make_preload_weight,
     make_sync_halt, make_tile_group, int32_vec,
 )
+from cim_compiler.cimres.hw_config import TILE  # Macro 物理维度 64×64 (单一事实源)
 from cim_compiler.export.weight_blob import read_weight_blob
-
-TILE = 64  # Macro 物理维度 64×64
 
 
 def _norm(name):

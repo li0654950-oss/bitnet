@@ -11,16 +11,4 @@
   hw_simulator    : CIM 纯硬件仿真器 (cycle 级时序 + MMIO, cim_stub.c 驱动)
   (运行时动态 M 由 cim_stub.c M 循环承担, 方案 C, seq_len 运行时吸收)
 """
-from .dialect import (
-    CIMRES_IRDL, register_cimres,
-    int8_vec, int32_vec, i32_attr, bool_attr, str_attr,
-    make_macro_matmul, make_preload_weight, make_sync_halt, make_tile_group,
-    attr_i32, attr_bool, attr_str,
-)
 
-__all__ = [
-    "CIMRES_IRDL", "register_cimres",
-    "int8_vec", "int32_vec", "i32_attr", "bool_attr", "str_attr",
-    "make_macro_matmul", "make_preload_weight", "make_sync_halt", "make_tile_group",
-    "attr_i32", "attr_bool", "attr_str",
-]

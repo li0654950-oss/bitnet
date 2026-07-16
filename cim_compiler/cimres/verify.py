@@ -11,7 +11,6 @@
   4. a_page 一致: 同 k_blk 的 a_page 相同 (共享输入页广播)
 
 verify(mod) -> issues: list[str], 空=通过。
-verify_or_raise(mod): 失败抛 ValueError (pipeline gate 用)。
 
 用法:
   python cim_compiler/cimres/verify.py --in <cimres.mlir>
@@ -49,7 +48,7 @@ def _check_double_buffer_layout(mod):
     检查 bank0/bank1 不重叠, bank1 不越界指令区。PSUM 同理。
     """
     from cim_compiler.cimres.hw_config import (
-        A_PAGE_BASE, A_PAGE_BANK1_BASE, PSUM_PAGE_BASE, PSUM_BANK1_BASE, INSTR_BASE)
+        A_PAGE_BASE, A_PAGE_BANK1_BASE, PSUM_BANK1_BASE, INSTR_BASE)
     issues = []
     max_a = max_p = 0   # S6: 用实际 a_page/psum_page (qkv 错开后 max 反映真实占用)
     for func_op, _ in func_blocks(mod):
@@ -66,14 +65,6 @@ def _check_double_buffer_layout(mod):
     if max_p >= PSUM_BANK1_BASE:
         issues.append(f"PSUM bank0 越界 bank1 (max psum_page=0x{max_p:x} >= 0x{PSUM_BANK1_BASE:x})")
     return issues
-
-
-def verify_or_raise(mod):
-    """verify 失败抛 ValueError。pipeline gate 用。"""
-    issues = verify(mod)
-    if issues:
-        raise ValueError("cimres verify 失败:\n  " + "\n  ".join(issues))
-    return True
 
 
 def _preload_dest_set(mod):

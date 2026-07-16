@@ -19,13 +19,13 @@ CIM_COMPILER = os.path.dirname(HERE)
 if CIM_COMPILER not in sys.path:
     sys.path.insert(0, CIM_COMPILER)
 
-from cim_compiler.cimres.hw_config import SHARED_SIZE   # 1MB 共享缓存 (面积/漏电)
+from cim_compiler.cimres.hw_config import SHARED_SIZE, TILE   # 1MB 共享缓存 + Macro 64×64 (单一事实源)
 
-# Macro 一次 matmul = int8[64] × ternary[64,64] -> int32[64] = 4096 MAC
-MAC_PER_MATMUL = 64 * 64
-A_PAGE_BYTES = 64          # int8[64] 激活输入 (K 维 tile)
-PSUM_BYTES = 64 * 4        # int32[64] 累加输出 (N 维 tile)
-TILE_BYTES = 1024          # 2bit packed 64×64 权重 tile (PROG_WGT)
+# Macro 一次 matmul = int8[TILE] × ternary[TILE,TILE] -> int32[TILE] = 4096 MAC
+MAC_PER_MATMUL = TILE * TILE
+A_PAGE_BYTES = TILE        # int8[TILE] 激活输入 (K 维 tile)
+PSUM_BYTES = TILE * 4      # int32[TILE] 累加输出 (N 维 tile)
+TILE_BYTES = TILE * TILE // 4   # 2bit packed TILE×TILE 权重 tile (PROG_WGT)
 
 
 @dataclass

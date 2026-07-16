@@ -43,10 +43,7 @@ for _p in (REPO, EXPORT_DIR):
 
 # CIM ASIC 硬件参数集中定义 (cim_compiler/cimres/hw_config.py, C/Python 镜像)
 from cim_compiler.cimres.hw_config import *   # noqa: F401  TILE/PAGE/三区/INSTR_CAPACITY/PRELOAD_BATCH/REG_BASE_DEFAULT/...
-from cim_compiler.cimres import hw_config      # 模块引用: T_ROUT_PER_HOP 运行时查表 (from-import-* 拷贝不可变 int 不传播, S4+ 修复)
 from cim_compiler.cimres.ppa_config import PPAConfig, ActivityTracker, PPAEstimator  # 架构级 PPA 估算
-FORWARD_MAGIC = b"CIMF"
-PRELOAD_MAGIC = b"CIMP"
 
 # ===== cycle 开销 (§3 无规定, 估算默认值, 真实硬件可调) =====
 T_FETCH    = 1    # 取指 (1 条 48-bit, §3.1)
@@ -126,7 +123,7 @@ class MacroArray:
         start = max(cycle, m.busy_until)                       # 同 Macro 串行
         packed = np.frombuffer(tile_2bit_1024B, dtype=np.uint8).reshape(TILE, TILE // 4)
         m.weight = unpack_2bit_np(packed)                      # 数值同步
-        m.busy_until = start + T_DISPATCH + dest_origin_hops(dest_id) * hw_config.T_ROUT_PER_HOP + T_PROG_WGT
+        m.busy_until = start + T_DISPATCH + T_PROG_WGT
         return m.busy_until
 
     def matmul(self, dest_id, x_int8_64, cycle):
@@ -134,7 +131,7 @@ class MacroArray:
         m = self.macro[dest_id]
         start = max(cycle, m.busy_until)                       # 同 Macro 串行
         y = m.weight.astype(np.int32) @ x_int8_64.astype(np.int32)  # 数值同步
-        m.busy_until = start + T_DISPATCH + dest_origin_hops(dest_id) * hw_config.T_ROUT_PER_HOP + T_MATMUL
+        m.busy_until = start + T_DISPATCH + T_MATMUL
         return y, m.busy_until
 
 

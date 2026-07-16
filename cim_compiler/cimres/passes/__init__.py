@@ -9,13 +9,4 @@ pass 序列 (C1 -> C2 间):
 
 verify 是安全网: 加 pass 后人工保证失效, 由 checker 兜底。
 """
-from cim_compiler.cimres.passes.common import (
-    load_cimres, parse_cimres, save, walk_ops,
-)
-from cim_compiler.cimres.passes.canonicalize import canonicalize
-from cim_compiler.cimres.passes.cse import cse
 
-__all__ = [
-    "load_cimres", "parse_cimres", "save", "walk_ops",
-    "canonicalize", "cse",
-]

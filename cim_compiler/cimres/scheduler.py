@@ -31,19 +31,12 @@ from cim_compiler.cimres.cost_model import estimate_func
 
 
 def build_tile_dag(ms):
-    """建 tile DAG: (n_blk, k_blk) -> K维累加依赖 (同 n 的 k_blk-1)。
+    """建 tile 索引: (n_blk, k_blk) -> matmul。
 
     K维累加: 同 n_blk 的 k_blk 串行 (psum_page 同, accum RMW), 不同 n_blk 并行。
-    返回 (deps, by_nk): deps[tile_key] = [dep_keys], by_nk[tile_key] = matmul。
+    返回 by_nk: {(n_blk, k_blk): matmul}。
     """
-    by_nk = {(m["n_blk"], m["k_blk"]): m for m in ms}
-    deps = {}
-    for (n, k) in by_nk:
-        d = []
-        if k > 0 and (n, k - 1) in by_nk:
-            d.append((n, k - 1))   # K维累加依赖 (必须 k-1 完成才能 k)
-        deps[(n, k)] = d
-    return deps, by_nk
+    return {(m["n_blk"], m["k_blk"]): m for m in ms}
 
 
 def list_schedule(ms):
@@ -55,7 +48,7 @@ def list_schedule(ms):
 
     返回调度顺序 [(n, k), ...]。
     """
-    deps, by_nk = build_tile_dag(ms)
+    by_nk = build_tile_dag(ms)
     if not by_nk:
         return []
     k_tiles = max(k for _, k in by_nk) + 1
