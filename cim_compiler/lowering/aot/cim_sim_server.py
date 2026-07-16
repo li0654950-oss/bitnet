@@ -12,6 +12,7 @@ import sys
 import socket
 import struct
 import argparse
+import gc
 from multiprocessing.shared_memory import SharedMemory
 
 HERE = os.path.dirname(os.path.abspath(__file__))    # .../cim_compiler/lowering/aot
@@ -95,8 +96,19 @@ def main():
         srv.close()
         if os.path.exists(args.socket):
             os.unlink(args.socket)
+        # 释放 numpy view (sim.cache.data = np.frombuffer(shm.buf)) 后再 close shm,
+        # 否则 shm.__del__ -> mmap.close() 因 exported pointer 报 BufferError (ctrl+C 退出时)
         try:
-            shm.unlink()   # 删除共享内存名 (mmap 进程退出自动释放; numpy view 持有不 close)
+            del sim
+        except NameError:
+            pass
+        gc.collect()       # 强制 GC numpy view, 解除 mmap exported pointer
+        try:
+            shm.close()
+        except BufferError:
+            pass
+        try:
+            shm.unlink()   # 删除共享内存名 (/dev/shm/cim_cache)
         except Exception as e:
             print(f"[server] shm unlink: {e}", file=sys.stderr)
 
