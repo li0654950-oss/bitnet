@@ -6,7 +6,7 @@
   - CPU op (norm/quant/rescale/attention/...) -> torch.aten.* (未降级 linalg)
 
 LINALG_ON_TENSORS 不可用: torchdynamo-export-to-torch-backend-pipeline 把 unknown
-torch.operator 标记 illegal (backend_legal_ops 无效), 故用 RAW (见 poc_torch_mlir.py T2)。
+torch.operator 标记 illegal (backend_legal_ops 无效), 故用 RAW 模式。
 CPU 降级 linalg 移到 lowering 阶段 (先 cim.matmul -> func.call 消除 unknown op, 再跑 linalg pipeline)。
 
 用法:

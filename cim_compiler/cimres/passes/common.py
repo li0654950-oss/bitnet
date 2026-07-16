@@ -86,5 +86,6 @@ def matmuls_in_func(func_op):
             "n_blk": attr_i32(op, "n_blk"),
             "k_blk": attr_i32(op, "k_blk"),
             "bitlinear_name": attr_str(op, "bitlinear_name"),
+            "role": attr_str(op, "role"),
         })
     return out

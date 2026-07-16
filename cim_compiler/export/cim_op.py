@@ -6,7 +6,7 @@ op 语义:
   w_packed [N, K//4] uint8    2bit 补码打包三值权重 (4 code/byte, CIM 预载)
   -> [M, N] int32              累加输出 (CIM->CPU 边界)
 
-注册为 torch custom op 后 (见 cim_compiler/ir/poc_export.py T1 / poc_torch_mlir.py T2):
+注册为 torch custom op 后:
   - torch.export 保留为 op 节点 (target str "cim.matmul.default", 不内联)
   - torch-mlir RAW 模式保留为 torch.operator "torch.cim.matmul"
   - LINALG pipeline 对 unknown torch.operator 报错 (backend_legal_ops 无效), 故 IR 导出用 RAW

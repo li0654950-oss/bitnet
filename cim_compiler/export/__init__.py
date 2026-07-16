@@ -11,16 +11,5 @@
 
 对应 cim_mlp.md 的 CIM 定点通路: int8 激活 × 2bit 节点 -> int32 累加 -> CPU rescale。
 """
-from .cim_op import cim_matmul, unpack_2bit_aten
-from .inference_model import BitLinearInference, build_inference_model
-from .weight_blob import write_weight_blob, read_weight_blob, WeightEntry
+from . import cim_op  # noqa: F401  (注册 cim::matmul custom op side-effect, torch.export 反序列化需要)
 
-__all__ = [
-    "cim_matmul",
-    "unpack_2bit_aten",
-    "BitLinearInference",
-    "build_inference_model",
-    "write_weight_blob",
-    "read_weight_blob",
-    "WeightEntry",
-]

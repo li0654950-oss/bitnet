@@ -11,22 +11,4 @@ CIM 节点 = matmul + 权重解包链 (对应 cim_mlp.md CIM Macro: 2bit 节点 
 物理可执行子图 GraphModule 在 export 图上不可行 (export 图密封: inline 子模块 / split 丢 magic /
 修改破坏 magic), 故用逻辑子图 (标注 + 边界 + 数据流验证), compiler 后端遍历原图按标签调度。
 """
-from .classify import mark_cim_nodes, node_backend, is_cim_matmul
-from .partition import (
-    CimBlock,
-    Boundary,
-    Partition,
-    partition_graph,
-    to_json,
-)
 
-__all__ = [
-    "mark_cim_nodes",
-    "node_backend",
-    "is_cim_matmul",
-    "CimBlock",
-    "Boundary",
-    "Partition",
-    "partition_graph",
-    "to_json",
-]

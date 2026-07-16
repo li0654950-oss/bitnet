@@ -42,12 +42,31 @@ def build_tile_dag(ms):
 def list_schedule(ms):
     """list scheduling: 关键路径优先 + K维依赖 + Macro 并行。
 
+    普通 BitLinear (role=none): k外n内 (同 k 的 n 并行, 共享 A_PAGE 广播) = C1 顺序。
+    qkv 合并 func (role q/k/v): k外bl内n内 (q<k<v, 各自 K 维累加独立, S6 合并) = C1 顺序。
     关键路径 = 同 n 的剩余 k 数 (k_tiles - k), k 小的关键路径长优先。
-    资源: 同 k_blk 的 n_blk 并行 (不同 Macro, 共享 a_page 广播)。
-    => 按 k 分层 (k 外), 每层 n 并行 (n 内) = C1 当前顺序。
 
-    返回调度顺序 [(n, k), ...]。
+    返回调度顺序 [(n_blk, k_blk), ...]。
     """
+    if not ms:
+        return []
+    roles = {m.get("role") for m in ms}
+    if roles & {"q", "k", "v"}:
+        # qkv 合并: 3D (bl, n, k), bl = q:0, k:1, v:2 (与 C1 一致, lower_to_cimres.py:87-89)
+        bl_order = {"q": 0, "k": 1, "v": 2}
+        by_bl_nk = {(bl_order[m["role"]], m["n_blk"], m["k_blk"]): m for m in ms}
+        k_tiles = max(k for _, _, k in by_bl_nk) + 1
+        n_tiles_bl = {}
+        for (bl, n, _) in by_bl_nk:
+            n_tiles_bl[bl] = max(n_tiles_bl.get(bl, 0), n + 1)
+        order = []
+        for kb in range(k_tiles):                  # k 外
+            for bl in range(3):                    # bl 内 (q<k<v)
+                for nb in range(n_tiles_bl.get(bl, 0)):  # n 内
+                    if (bl, nb, kb) in by_bl_nk:
+                        order.append((nb, kb))
+        return order
+    # 普通 BitLinear: 2D (n, k), k外n内
     by_nk = build_tile_dag(ms)
     if not by_nk:
         return []
