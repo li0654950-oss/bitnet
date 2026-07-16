@@ -23,7 +23,6 @@ for _p in (REPO, EXPORT_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import numpy as np
 from cim_compiler.cimres.hw_simulator import HwCimSimulator, SHARED_SIZE
 from cim_compiler.cimres.ppa_config import format_ppa_report   # PPA 报告格式化
 

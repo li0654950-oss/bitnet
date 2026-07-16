@@ -259,7 +259,6 @@ def main():
 
     print(f"[L3] 插 func.call @cim_launch_<idx> (替换 placeholder linalg.matmul)...", file=sys.stderr)
     n = lower_linalg_to_cim_call(mod, args.partition)
-    with open("/tmp/l3_after_lower.mlir", "w") as f: f.write(str(mod))  # S6 debug
     try:
         mod.operation.verify()
         print(f"[L3] lower 后 verify OK, n_call={n}", file=sys.stderr)

@@ -12,3 +12,5 @@ checkpoints/
 *.o
 *.so
 *.bin
+cim_compiler/lowering/aot/cim_sim
+cim_compiler/lowering/aot/cim_sim_kv

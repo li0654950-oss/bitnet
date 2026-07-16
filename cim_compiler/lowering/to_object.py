@@ -11,7 +11,6 @@ shared_libs 提供。JIT 执行 (L6) 已验证功能, L7 .o 仅作可链接产�
 """
 import os
 import sys
-import ctypes
 import argparse
 import importlib.util
 
@@ -28,11 +27,6 @@ from torch_mlir.dialects import torch as torch_d
 from torch_mlir.fx import _module_lowering
 from torch_mlir.compiler_utils import OutputType, run_pipeline_with_repro_report
 from torch_mlir.execution_engine import ExecutionEngine
-from torch_mlir.runtime import UnrankedMemRefDescriptor
-
-CONSUME_PREFIX = "refbackend_consume_func_return_"
-ELEMENTAL = {"i1": ctypes.c_bool, "i8": ctypes.c_byte, "i64": ctypes.c_int,
-             "f32": ctypes.c_float, "f64": ctypes.c_double}
 
 
 def _load(name, path):
