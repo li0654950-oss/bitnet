@@ -25,11 +25,10 @@ import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
-_EXPORT_DIR = os.path.join(REPO, "cim_compiler", "export")
-if _EXPORT_DIR not in sys.path:
-    sys.path.insert(0, _EXPORT_DIR)
+
+# torch_mlir_e2e_test 不在 pip wheel (torch_mlir dist-info 无 e2e_test 子模块), 需从
+# torch-mlir 源码树导入 (refbackend L4 pipeline 用)。非 bitnet-cim 包范围, editable
+# 安装解决不了, 保留此路径 hack。
 _E2E_PATH = "/home/li/workspace/torch-mlir/projects/pt1/python"
 if _E2E_PATH not in sys.path:
     sys.path.insert(0, _E2E_PATH)
@@ -188,7 +187,7 @@ def build_inputs(model, idx, exported_program=None):
         exported_program = _ep_cache.get("default")
         if exported_program is None:
             try:
-                import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
+                from cim_compiler.export import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
             except ImportError:
                 pass
             exported_program = torch.export.load(DEFAULT_PT2)
@@ -227,7 +226,7 @@ def build_inputs_kv(model, idx, k_caches, v_caches, cos, sin, exported_program=N
         exported_program = _ep_cache.get("kv")
         if exported_program is None:
             try:
-                import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
+                from cim_compiler.export import cim_op  # 注册 cim::matmul (反序列化 .pt2 需要)
             except ImportError:
                 pass
             exported_program = torch.export.load(os.path.join(REPO, "checkpoints/bitnet_ternary_kv.pt2"))
@@ -346,7 +345,7 @@ def main():
         print(f"[L6] 纯硬件 CIM 仿真器 MMIO 回调已注册 + cim_preload_init "
               f"({len(sim.macros.macro)} Macro 预载)", file=sys.stderr)
 
-    from inference_model import build_inference_model
+    from cim_compiler.export.inference_model import build_inference_model
     model = build_inference_model(args.ternary, vocab_size=args.vocab_size,
                                   d_model=args.d_model, block_size=args.block_size,
                                   n_layer=args.n_layer, n_head=args.n_head,

@@ -3,17 +3,6 @@
 封装 torch-mlir Python binding 的 Context 创建 + cimres dialect 注册 + 遍历,
 让 canonicalize/cse/verify 聚焦逻辑而非样板代码。
 """
-import os
-import sys
-
-HERE = os.path.dirname(os.path.abspath(__file__))          # cim_compiler/cimres/passes/
-CIMRES = os.path.dirname(HERE)                             # cim_compiler/cimres/
-CIM_COMPILER = os.path.dirname(CIMRES)                     # cim_compiler/
-REPO = os.path.dirname(CIM_COMPILER)                       # repo root
-for _p in (REPO,):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 from torch_mlir import ir
 from cim_compiler.cimres.dialect import register_cimres
 

@@ -25,15 +25,9 @@ placeholder 把 W 当 uint8 repeat 4x (K/4->K) 模拟 unpack, 数值错但形状
   python cim_compiler/lowering/cim_lowering.py --in checkpoints/bitnet_ternary.mlir \\
     --out checkpoints/bitnet_ternary_placeholder.mlir
 """
-import os
 import sys
 import re
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
 
 from torch_mlir import ir
 from torch_mlir.dialects import torch as torch_d

@@ -15,15 +15,6 @@ import argparse
 import gc
 from multiprocessing.shared_memory import SharedMemory
 
-HERE = os.path.dirname(os.path.abspath(__file__))    # .../cim_compiler/lowering/aot
-LOWERING = os.path.dirname(HERE)                     # .../cim_compiler/lowering
-CIM_COMPILER = os.path.dirname(LOWERING)             # .../cim_compiler
-REPO = os.path.dirname(CIM_COMPILER)                 # repo root
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")    # cim_op 所在 (inference_model import)
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 from cim_compiler.cimres.hw_simulator import HwCimSimulator, SHARED_SIZE
 from cim_compiler.cimres.ppa_config import format_ppa_report   # PPA 报告格式化
 

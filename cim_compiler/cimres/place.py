@@ -19,17 +19,8 @@ dest_id (Macro 分配) C1 已全局分配 (0~3663), C2 确认 < 4096 Macro (§4.
 用法:
   nanogpt-gpu python cim_compiler/cimres/place.py
 """
-import os
 import sys
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from torch_mlir import ir
 from cim_compiler.cimres.dialect import register_cimres, i32_attr

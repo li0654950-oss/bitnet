@@ -16,14 +16,6 @@ import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
-_EXPORT_DIR = os.path.join(REPO, "cim_compiler", "export")
-if _EXPORT_DIR not in sys.path:
-    sys.path.insert(0, _EXPORT_DIR)
-_E2E_PATH = "/home/li/workspace/torch-mlir/projects/pt1/python"
-if _E2E_PATH not in sys.path:
-    sys.path.insert(0, _E2E_PATH)
 
 import numpy as np
 import torch
@@ -125,7 +117,7 @@ def main():
         print(f"[run] CIM 仿真器就绪 (MMIO + cycle 时序, {len(sim.macros.macro)} Macro 预载)",
               file=sys.stderr)
 
-    from inference_model import build_inference_model
+    from cim_compiler.export.inference_model import build_inference_model
     model = build_inference_model(args.ternary, vocab_size=65)
 
     # ---- JIT 仿真生成 ----

@@ -8,19 +8,13 @@
   python cim_compiler/gen_random_model.py --n_layer 2 --d_model 256 --ffn_dim 1024 --out /tmp/small.pt
   python cim_compiler/pipeline.py --ternary /tmp/small.pt --n_layer 2 --d_model 256 --ffn_dim 1024
 """
-import os
 import sys
 import math
 import argparse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
-BITNET_DIR = os.path.join(REPO, "bitnet")
-sys.path.insert(0, BITNET_DIR)
-
 import torch
-from model import BitNet
-from export_ternary import weight_quant, pack_2bit, is_bitlinear_weight
+from bitnet.model import BitNet
+from bitnet.export_ternary import weight_quant, pack_2bit, is_bitlinear_weight
 
 
 def gen(vocab_size, d_model, block_size, n_layer, n_head, n_kv_head, ffn_dim, out, seed=42):

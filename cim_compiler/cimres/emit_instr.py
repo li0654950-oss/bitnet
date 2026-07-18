@@ -22,19 +22,10 @@ word = (opcode<<45)|(dest_id<<33)|(page1<<21)|(page2<<9)|(accum<<8), 每条 6 �
 用法:
   nanogpt-gpu python cim_compiler/cimres/emit_instr.py
 """
-import os
 import sys
 import math
 import struct
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 import numpy as np
 from torch_mlir import ir

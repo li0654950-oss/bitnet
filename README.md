@@ -66,6 +66,28 @@ torch-mlir 2026 对部分 op 降级不全，bitnet 代码做了适配（`cim_com
 4. **seq f32**（`RotaryMHA`）：`torch.arange` 默认 i64，与 `inv_freq`（f32）einsum 后
    cast 失败；显式 `.to(torch.float32)`。
 
+### bitnet-cim 包（editable 安装）
+
+`pyproject.toml` 把 `bitnet/` + `cim_compiler/` 声明为 `bitnet-cim` 包（含 `ir` / `lowering.aot` regular 子包），editable 安装后全 repo 用绝对包导入，取代各脚本顶部的 `sys.path.insert` hack：
+
+```bash
+pip install -e .                       # editable 安装 (repo 根, pyproject.toml 所在)
+```
+
+安装后：
+
+| 用法 | 说明 |
+|---|---|
+| `cim-pipeline` 命令 | 任意 cwd 跑全 12 步流水线（`pyproject.toml` 注册的 console script = `cim_compiler.pipeline:main`）|
+| 绝对包导入 | `from cim_compiler.export.inference_model import` / `from bitnet.model import`，取代裸模块 + sys.path hack |
+| 包结构 | `bitnet` + `cim_compiler`（`cimres`/`export`/`partition`/`lowering`/`ir`/`lowering.aot` 均为 regular 子包）|
+
+**前提**：cim_compiler 各脚本已删 sys.path hack（包化重构后），**必须 editable 安装**才能跑——绝对导入依赖 `cim_compiler`/`bitnet` 是可导入包；未安装则 `import cim_compiler.X` 失败。
+
+**外部依赖（editable 解决不了）**：`cim_jit.py`/`to_object.py`/`linalg_to_llvm.py` 用 `torch_mlir_e2e_test`（refbackend L4 pipeline），它不在 pip wheel 里，需从 torch-mlir 源码树导入——脚本内保留 `_E2E_PATH = "/home/li/workspace/torch-mlir/projects/pt1/python"` 路径 hack（机器特定，后续可改环境变量）。
+
+**加新包后刷新**：新增 `__init__.py`（新子包）需重新 `pip install -e .` 让 setuptools 重新发现包（egg-info/SOURCES.txt 自动更新）。
+
 ### 已知坑
 
 - **dev wheel 只配 nightly**：torch-mlir 预编译只有 nightly，无 stable 版本，故用 torch nightly。
@@ -113,40 +135,75 @@ python data/shakespeare_char/prepare.py   # 生成 train.bin, val.bin, meta.pkl
 
 ## 用法
 
-```bash
-# 0. 环境
-conda activate nanogpt-gpu   # torch 2.12 dev + torch-mlir 2026 dev wheel
+所有命令在 `nanogpt-gpu` env 下运行（`conda activate nanogpt-gpu`，或绝对路径 `/home/li/anaconda3/envs/nanogpt-gpu/bin/python`）。CIM 编译前端依赖 editable 安装（`pip install -e .`，见「环境」章节）。
 
+### 端到端：训练 -> 三值推理
+
+```bash
 # 1. 准备数据（vocab=65）
 python data/shakespeare_char/prepare.py
 
-# 2. 训练（nanoGPT 训练循环 + BitNet 论文 lr/wd 调度，bf16）
-#    自动保存 val 最优 -> checkpoints/bitnet_shakespeare_char_best.pt
+# 2. 训练（nanoGPT 循环 + BitNet lr/wd 调度, bf16; 自动保存 val 最优 -> checkpoints/bitnet_shakespeare_char_best.pt）
 python bitnet/train_shakespeare_char.py
 python bitnet/train_shakespeare_char.py --smoke          # 20 步冒烟测试
 
-# 3. 生成（float32 采样推理，默认 temperature=0.8 top_k=40）
-python bitnet/generate_shakespeare_char.py --prompt "ROMEO:" --max_tokens 128 --seed 0   # --seed 可复现
+# 3. 生成（float32 采样, 默认 temperature=0.8 top_k=40; --seed 可复现）
+python bitnet/generate_shakespeare_char.py --prompt "ROMEO:" --max_tokens 128 --seed 0
 python bitnet/generate_shakespeare_char.py                                              # 从 BOS 自由采样
 #    注: 默认 --dtype float32 规避 sdpa dtype 坑 (见"已知坑"); greedy 对比用 _greedy_ref.py
 
 # 4. 导出 2bit 三值权重（float32 -> 2bit packed, 8x 压缩, ~3.7 MB）
 python bitnet/export_ternary.py
 
-# 5. 三值推理（2bit packed + Triton kernel，无需解包）
+# 5. 三值推理（2bit packed + Triton kernel, 无需解包; 详见下方「三值推理」）
 python bitnet/generate_shakespeare_char.py --ternary --prompt "ROMEO:" --max_tokens 128 --seed 0
-
-# 6. CIM 编译前端 + 系统仿真（见下方 cim_compiler）
-python cim_compiler/pipeline.py                    # 一键流水线 (12 步: export->...->JIT 验证 + AOT, 非 KV)
-python cim_compiler/pipeline.py --kv               # KV 流水线 (export_kv->...->cim_sim_kv, 跳过 cim_jit)
-python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 60          # JIT 文本生成仿真
-python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv     # JIT KV cache 增量 (O(n²)->O(n))
-./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60                        # AOT 全序列系统仿真
-./cim_compiler/lowering/aot/run_aot_kv.sh --prompt "ROMEO:" --n 80                     # AOT KV cache 增量 (n=80 speedup 42x)
 ```
 
-预期表现：best val ≈ 1.53，约在 step 1250 达到（笔记本 GPU 约 4 分钟），
-约 step 2500 触发早停。
+预期表现：best val ≈ 1.53，约在 step 1250 达到（笔记本 GPU 约 4 分钟），约 step 2500 触发早停。
+
+### CIM 编译前端 + 系统仿真（cim_compiler）
+
+```bash
+# === 一键流水线 (12 步: export -> ... -> JIT 验证 + AOT; 非 KV + KV 两条独立) ===
+python cim_compiler/pipeline.py                              # 非 KV 全流程 (export_fx -> cim_sim, make nv)
+python cim_compiler/pipeline.py --kv                         # KV 流程 (export_kv -> cim_sim_kv, make kv, 跳过 cim_jit)
+python cim_compiler/pipeline.py --start-step 12              # 只跑 AOT 构建 (调试)
+python cim_compiler/pipeline.py --no-sim                     # 跳过 JIT 仿真
+
+# === 多规模回归 (任意规模 ≤4096 Macro, 随机权重验证编译兼容) ===
+python cim_compiler/gen_random_model.py --n_layer 2 --d_model 256 --ffn_dim 1024 --out /tmp/small.pt
+python cim_compiler/pipeline.py --ternary /tmp/small.pt --n_layer 2 --d_model 256 --ffn_dim 1024
+
+# === JIT 系统仿真 (CPU LLVM JIT + CIM hw_simulator, ctypes 同进程) ===
+python cim_compiler/lowering/cim_jit.py --sim                # 单次 forward + max_diff 验证
+python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 60        # 文本生成 (全序列, O(n²))
+python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv   # KV cache 增量 (decode M=1, O(n))
+# 采样解码 (默认 greedy; 加 --temperature >0 启用 softmax+top_k+multinomial, 打破 greedy 坍缩, JIT/ref 同 seed 对比):
+python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv --temperature 0.8 --top_k 40 --seed 0
+
+# === AOT 系统仿真 (CPU 可执行文件 + IPC 仿真器, 跨进程) ===
+make -C cim_compiler/lowering/aot nv                       # 构建 cim_sim (非 KV only, 不依赖 KV 产物)
+make -C cim_compiler/lowering/aot kv                       # 构建 cim_sim_kv (KV only)
+make -C cim_compiler/lowering/aot                          # 构建 cim_sim + cim_sim_kv (all = nv + kv, 需两者产物就绪)
+./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60           # 全序列一键 (nohup server + cim_sim + kill)
+./cim_compiler/lowering/aot/run_aot_kv.sh --prompt "ROMEO:" --n 80        # KV cache 增量一键 (cim_sim_kv --kv)
+# AOT 采样 (默认 greedy; 加 --temperature >0 启用 C 侧 softmax+top_k+multinomial; srand(seed+1) 避 glibc srand(0)==srand(1) 陷阱, 不同 seed 不同输出):
+./cim_compiler/lowering/aot/run_aot.sh    --temperature 0.8 --top_k 40 --seed 0 --prompt "ROMEO:" --n 60   # 全序列采样
+./cim_compiler/lowering/aot/run_aot_kv.sh --temperature 0.8 --top_k 40 --seed 0 --prompt "ROMEO:" --n 80   # KV 增量采样
+# 或分两步 (server 先启动循环 accept; cim_sim 跑完断开, server 留守下一连接):
+python cim_compiler/lowering/aot/cim_sim_server.py --socket /tmp/cim_sim.sock &
+./cim_compiler/lowering/aot/cim_sim --socket /tmp/cim_sim.sock --prompt "ROMEO:" --n 60           # 全序列
+./cim_compiler/lowering/aot/cim_sim_kv --socket /tmp/cim_sim.sock --kv --prompt "ROMEO:" --n 80   # 增量 (n=80 speedup 42x)
+# PPA: cim_sim 跑完 server 自动打印架构级 PPA 报告 (28nm@1GHz: 耗时/功耗/能效/面积), 详见 sys_sim.md §7
+#      小批量快速看 PPA: 先启 server, 再 ./cim_sim --prompt R --n 3
+
+# === KV cache CIM cycle 量化 (cost_model, 不跑仿真器, 秒级) ===
+python cim_compiler/cimres/cost_model.py --kv 80    # n=80: 全序列重算 vs KV cache cycle + speedup (40.5x, 实测 42x)
+python cim_compiler/cimres/cost_model.py --kv       # 对比表 n=32/64/128/256 (speedup ≈ (n+1)/2, O(n²)->O(n))
+
+# === KV cache 数值验收 (PyTorch ref: 全序列 use_cache=False vs 增量 KV cache greedy) ===
+python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n=128 良性浮点分歧 (relu² 放大)
+```
 
 ## 三值推理（2bit 打包 + Triton kernel）
 
@@ -234,53 +291,6 @@ cim_compiler/
 
 两者数值完全一致（max_diff=0），AOT 模式更接近真实 CPU↔硬件分离。KV cache 实测 n=80 speedup **42x**（全序列 `cim=22819256` vs 增量 `cim=542784`，≈ n/2）。
 
-### 运行指令
-
-```bash
-# 0. 环境
-conda activate nanogpt-gpu   # 或直接 /home/li/anaconda3/envs/nanogpt-gpu/bin/python ...
-
-# === 一键流水线 (12 步: export -> ... -> JIT 验证 + AOT; 非 KV + KV 两条独立) ===
-python cim_compiler/pipeline.py                              # 非 KV 全流程 (export_fx -> cim_sim, make nv)
-python cim_compiler/pipeline.py --kv                         # KV 流程 (export_kv -> cim_sim_kv, make kv, 跳过 cim_jit)
-python cim_compiler/pipeline.py --start-step 12              # 只跑 AOT 构建 (调试)
-python cim_compiler/pipeline.py --no-sim                     # 跳过 JIT 仿真
-
-# === 多规模回归 (任意规模 ≤4096 Macro, 随机权重验证编译兼容) ===
-python cim_compiler/gen_random_model.py --n_layer 2 --d_model 256 --ffn_dim 1024 --out /tmp/small.pt
-python cim_compiler/pipeline.py --ternary /tmp/small.pt --n_layer 2 --d_model 256 --ffn_dim 1024
-
-# === JIT 系统仿真 (CPU LLVM JIT + CIM hw_simulator, ctypes 同进程) ===
-python cim_compiler/lowering/cim_jit.py --sim                # 单次 forward + max_diff 验证
-python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 60        # 文本生成 (全序列, O(n²))
-python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv   # KV cache 增量 (decode M=1, O(n))
-# 采样解码 (默认 greedy argmax 用于 token 级验证; 加 --temperature >0 启用 softmax+top_k+multinomial, 打破 greedy 坍缩, JIT/ref 同 seed 对比):
-python cim_compiler/lowering/run_sim_text.py --prompt "ROMEO:" --num-tokens 80 --kv --temperature 0.8 --top_k 40 --seed 0
-
-# === AOT 系统仿真 (CPU 可执行文件 + IPC 仿真器, 跨进程) ===
-make -C cim_compiler/lowering/aot nv                       # 构建 cim_sim (非 KV only, 不依赖 KV 产物)
-make -C cim_compiler/lowering/aot kv                       # 构建 cim_sim_kv (KV only)
-make -C cim_compiler/lowering/aot                          # 构建 cim_sim + cim_sim_kv (all = nv + kv, 需两者产物就绪)
-./cim_compiler/lowering/aot/run_aot.sh --prompt "ROMEO:" --n 60           # 全序列一键 (nohup server + cim_sim + kill)
-./cim_compiler/lowering/aot/run_aot_kv.sh --prompt "ROMEO:" --n 80        # KV cache 增量一键 (cim_sim_kv --kv)
-# AOT 采样 (默认 greedy; 加 --temperature >0 启用 C 侧 softmax+top_k+multinomial; srand(seed+1) 避 glibc srand(0)==srand(1) 陷阱, 不同 seed 不同输出):
-./cim_compiler/lowering/aot/run_aot.sh    --temperature 0.8 --top_k 40 --seed 0 --prompt "ROMEO:" --n 60   # 全序列采样
-./cim_compiler/lowering/aot/run_aot_kv.sh --temperature 0.8 --top_k 40 --seed 0 --prompt "ROMEO:" --n 80   # KV 增量采样
-# 或分两步 (server 先启动循环 accept; cim_sim 跑完断开, server 留守下一连接):
-python cim_compiler/lowering/aot/cim_sim_server.py --socket /tmp/cim_sim.sock &
-./cim_compiler/lowering/aot/cim_sim --socket /tmp/cim_sim.sock --prompt "ROMEO:" --n 60           # 全序列
-./cim_compiler/lowering/aot/cim_sim_kv --socket /tmp/cim_sim.sock --kv --prompt "ROMEO:" --n 80   # 增量 (n=80 speedup 42x)
-# PPA: cim_sim 跑完 server 自动打印架构级 PPA 报告 (28nm@1GHz: 耗时/功耗/能效/面积), 详见 sys_sim.md §7
-#      小批量快速看 PPA: 先启 server, 再 ./cim_sim --prompt R --n 3
-
-# === KV cache CIM cycle 量化 (cost_model, 不跑仿真器, 秒级) ===
-python cim_compiler/cimres/cost_model.py --kv 80    # n=80: 全序列重算 vs KV cache cycle + speedup (40.5x, 实测 42x)
-python cim_compiler/cimres/cost_model.py --kv       # 对比表 n=32/64/128/256 (speedup ≈ (n+1)/2, O(n²)->O(n))
-
-# === KV cache 数值验收 (PyTorch ref: 全序列 use_cache=False vs 增量 KV cache greedy) ===
-python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n=128 良性浮点分歧 (relu² 放大)
-```
-
 ### 产物
 
 | 文件 | 内容 |
@@ -311,6 +321,91 @@ python cim_compiler/export/verify_kv.py            # n=32 greedy 完全一致; n
 - **PPA 架构级估算**：`ppa_config.py` 在仿真器上加活动因子统计，28nm@1GHz 估算计算耗时/功耗能效/面积（±30~50%），cim_sim 跑完 server 自动打印报告（见 `sys_sim.md` §7）。
 - **KV cache（CPU 侧，CIM 零改动）**：`inference_model.py` `RotaryMHAInference.step_stateless(h, k_in, v_in, cos, sin)` 无状态增量 forward（cache 显式 IO，cos/sin 外部传入避免动态 arange），`_KVCacheModel` 包装导出 dynamic T cache。CIM/lowering/cim_stub 零改动，O(n²)->O(n) 由 `cim_launch` 运行时 M 维 T->1（`cim_stub.c` 对 M 行循环，makespan ∝ M 行数，非 M-tile ceil(T/64)）。AOT 多输出 consume `mrf32_mrf32_mrf32`（3 个 `{i64,ptr}*` 参数，对齐 refbackend `get_ctype_func`）。实测 n=80 speedup 42x（`cost_model --kv` 量化 speedup ≈ (n+1)/2）。
 - **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（q:0-63/k:64-95/v:96-127），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` 用 partition.json 元数据识别 qkv（方案 B: role q/k/v + 同 blk_idx, IR walk 顺序 == cim_blocks 展开顺序; 替代旧 shape 启发式 [Nq>Nk=Nv]）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
+
+### 编译器架构分析
+
+> 上面「关键设计」讲实现机制（怎么做），本节讲架构特征、权衡与扩展边界（是什么/为什么/边界）。
+
+**定位**：单算子存算加速器前端。所有 CIM 加速收敛到 `cim::matmul` 一个 op（int8×2bit 三值 -> int32），其余算子（norm/量化/rescale/attention/embedding）一律 CPU。扩展边界 = 这个算子语义能覆盖多少架构，非通用 NPU 编译器。
+
+#### 三个硬假设点（架构耦合处）
+
+| # | 位置 | 硬编码内容 |
+|---|---|---|
+| 1 | `inference_model.py` `_replace` | 只 isinstance 认 `BitLinear` + `RotaryMHA`，硬 `from bitnet.model import` |
+| 2 | `cim_op.py` | op 签名写死 `int8[M,K] × 2bit三值[N,K//4] -> int32[M,N]`（解包/位宽/精度全硬编码）|
+| 3 | `classify.py` + `cimres/dialect.py` | CIM 节点只有 `cim.matmul`；cimres IR 只有 matmul tile 类 op |
+
+#### 数据流：权重静态全驻留 / 激活动态广播
+
+Macro 不存激活/PSUM，只存权重；激活和 PSUM 在 1MB SharedCache（SRAM）。
+
+| 空间 | 存什么 | 生命周期 |
+|---|---|---|
+| Macro RRAM（4096×64×64 2bit cell）| 权重 1 tile = 1024B | **静态全驻留**（RRAM 非易失，推理期不重载）|
+| SharedCache A_PAGE（`0x010+`）| 激活 int8（64B/tile）| 动态，每 token 重写 |
+| SharedCache PSUM（`0xC00+`）| 输出 int32（256B/tile）| RMW 累加，K 维多 tile 共享 |
+
+- **权重**：3664 tile 一次性 Preload 到 3664 个 Macro（< 4096），跨层共享不重载，利用率 **89%**。dest_id 线性编号（mesh 清理后 `T_ROUT_PER_HOP=0`，无物理 2D 网格路由，所有 Macro 等价）。
+- **激活**：K 维切 `k_tiles` 段存 a_page，同 k_blk 的多个 N-tile **广播共享**读入（1 份激活喂多个 Macro）。
+- **PSUM**：同 n_blk 跨 K 维 RMW 累加（`accum` 字段，首拍覆盖、后续累加）。
+
+一次 q_proj（512×512，M=1 单 token）运算的分布：
+
+```
+权重: Macro[0..63] 各持 64×64 tile (Preload 驻留, 不动)
+kb=0: a_page=0x010 ─广播─> Macro[ 0.. 7] 并行 8 N-tile -> psum 0xC00..0xC07 (accum=0 覆盖)
+kb=1: a_page=0x011 ─广播─> Macro[ 8..15] 并行 8 N-tile -> psum 0xC00..0xC07 (accum=1 累加)
+  ...
+kb=7: a_page=0x017 ─广播─> Macro[56..63] 并行 8 N-tile -> psum = 完整 512 int32 输出
+```
+
+#### 时序模型（`hw_config.py`，@1GHz -> 1 cycle = 1 ns）
+
+| 常量 | cycle | 含义 |
+|---|---|---|
+| T_DISPATCH | 2 | 广播总线路由 Dest_ID |
+| T_PROG_WGT | 10 | Preload：2bit tile 解包装载 |
+| T_MATMUL | 64 | 运算：ADC 逐列量化 64 列（KCL 并行 1 cycle，**ADC 串行是瓶颈**，非 KCL）|
+| T_WB | 4 | 写回：int32 RMW 累加 |
+
+- 稳态一次 tile = T_DISPATCH + T_MATMUL + T_WB = **70 cycle**（70 ns）
+- 调度：**k 外 n 内**（K 维串行避免 PSUM 写冲突，N 维并行共享 a_page 广播）
+- 单 Macro 峰值 64 MAC/cycle = 0.128 TOPS @1GHz；4096 Macro 满载 ~524 TOPS（理论，受 dispatch/总线/利用率限制）
+
+#### PPA 估算口径（`ppa_config.py`，28nm@1GHz，±30~50%）
+
+- **TOPS = 2 × GMACs**：1 MAC = 2 OP 标称口径（工业标称，非 CIM 物理实际操作数）。CIM 三值权重省乘法器，能效高主要来自**能耗分母小**（e_mac=0.5pJ），非分子。
+- **两口径**：稳态 `tops_w`（不含 Preload 一次性 RRAM 编程）/ amortized `tops_w_amort`（含 Preload 分摊到本次）。
+- **估算偏保守**：`n_mac` / `n_prog_cell` 按全 tile 4096 计，未扣 0 权重 -> 能耗高估、能效低估（见下）。
+
+#### 稀疏性：32% 训练 0 + 0.21% 补零
+
+- **训练稀疏 0**：4,791,436（32.0%），模型学出，各层均匀（30~33%），+1/-1 近乎对称（34.08% / 33.92%）
+- **结构补零**：32,256（0.21%），tile 对齐 ceil 补的，集中在 `lm_head` 尾部 8 个 Macro（vocab=65 非 64 整除，每 Macro 98.4% 是补零）
+
+CIM 对 0 权重的稀疏红利分三层（核心：0 cell 电导 G=0 -> 电流 I=0，欧姆定律物理天然不贡献，非「检测后跳过」）：
+
+| 资源 | 能否省 | 原因 |
+|---|---|---|
+| MAC 动态能耗 | ✅ 天然省 | RRAM G=0 -> I=0，0 cell 物理不产生电流（已发生）|
+| Preload 编程能耗 | ✅ 可省（需 ISA 改）| 0 cell 可不编程（默认高阻=0），省 ~32% 写入 |
+| 计算时序 T_MATMUL | ❌ 省不了 | ADC 逐列量化，列内 0 不影响；整列全 0 概率 = 0.32⁶⁴ ≈ 0 |
+
+> 当前 PPA 按全 tile 计未反映 32% 物理红利 -> 估算保守。L1（零硬件改 `ppa_config` 统计非零）可让估算诚实化；L2（ISA 加 partial PROG_WGT + 位图）省真实 Preload 能耗。三值 2bit 稠密已紧凑，存储稀疏化不划算（元数据开销抵消收益）。
+
+#### 架构扩展边界（变化支持矩阵）
+
+| 架构变化 | 支持度 | 改动点 |
+|---|---|---|
+| 层数/维度/head/FFN/vocab/seq_len | 零改动（参数化）| - |
+| GQA | 已支持 | `n_kv_head`（`RotaryMHAInference`）|
+| norm/激活/attention 变体/FFN 加 gate | 小改 | 仅 `inference_model.py` 层适配，CIM/lowering 零改动 |
+| 权重位宽/激活精度/累加精度 | 全链改 | op 签名 -> cimres -> hw_config -> ppa |
+| 新增 CIM 算子（conv/attention 加速）| 全链改 | op -> classify -> dialect -> lower -> emit -> sim -> ppa |
+| MoE 动态路由 / 跨层存算融合 | 需重写 | FX 静态图 + 单 matmul tile IR 模型不支持 |
+
+一句话：**Transformer + Linear 范式内的演化基本能支持（只改 `inference_model`，CIM 零改动）；量化/位宽/精度或新算子是全链改；MoE/跨层融合需重写**。
 
 详见 `sys_sim.md`（系统仿真运行时，JIT + AOT）+ `cim_mlp.md`（CIM 架构规范）。
 

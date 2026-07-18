@@ -26,15 +26,9 @@ int8 tensor, 替换整条 cast 链为一个 func.call @cim_launch_<idx>:
   python cim_compiler/lowering/cim_stub_lower.py --in checkpoints/bitnet_ternary_placeholder.mlir \\
     --out checkpoints/bitnet_ternary_final.mlir
 """
-import os
 import sys
 import json
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
 
 from torch_mlir import ir
 from torch_mlir.dialects import torch as torch_d, func as func_d, arith as arith_d, tensor as tensor_d

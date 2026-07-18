@@ -8,17 +8,8 @@ canon/cse 在逻辑层 (cimres.mlir, 占位 PAGE), 处理 dest_id/sync_halt/prel
 用法:
   python cim_compiler/cimres/run_passes.py --in <cimres.mlir> --out <cimres.mlir>
 """
-import os
 import sys
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from cim_compiler.cimres.passes.common import load_cimres, save
 from cim_compiler.cimres.passes.canonicalize import canonicalize

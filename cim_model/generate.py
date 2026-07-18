@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CIM 定点模型推理生成 (shakespeare_char)。
 
-用 cim_model 定点数据通路 (per-token int8 量化 → 64×64 Macro → int32 累加 → fp32 rescale → 边界降 bf16)
+用 cim_model 定点数据通路 (per-token int8 量化 → 64×64 Macro → int32 累加 → fp32 rescale → 边界降 fp32)
 替换 BitLinear.forward, 复用 model.py 全部结构 + nanoGPT 风格采样。
 
 注意: CIM 核心是 numpy int32 (CPU), 故默认 CPU 运行 (即便指定 cuda, BitLinear 内部仍 .cpu() 算)。
@@ -74,7 +74,7 @@ def main():
 
     orig_fwd = patch_bitlinear()
     try:
-        model = BitNet(vocab, **CFG).to(device, dtype=torch.bfloat16)
+        model = BitNet(vocab, **CFG).to(device, dtype=torch.float32)
         n_ternary = load_ternary_into_model(model, TERNARY, device)
         model.eval()
         print(f"[CIM 定点通路 | {n_ternary} BitLinear | {device} | "

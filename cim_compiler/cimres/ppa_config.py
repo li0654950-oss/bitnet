@@ -10,14 +10,7 @@
 并行模型 (给定 T_MATMUL 单 macro GEMV 耗时, cim_cycle 即真实并行耗时), 只加频率转 ns。
 功耗需活动因子 (ActivityTracker), 面积纯资源数 × 工艺参数。
 """
-import os
-import sys
 from dataclasses import dataclass
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-if CIM_COMPILER not in sys.path:
-    sys.path.insert(0, CIM_COMPILER)
 
 from cim_compiler.cimres.hw_config import SHARED_SIZE, TILE   # 1MB 共享缓存 + Macro 64×64 (单一事实源)
 

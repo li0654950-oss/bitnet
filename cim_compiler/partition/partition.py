@@ -18,27 +18,20 @@ custom op 模式 (cim::matmul): CIM 节点 = cim.matmul op 节点本身 (解包/
   python cim_compiler/partition/partition.py --graph checkpoints/bitnet_ternary.pt2 \\
     --out checkpoints/bitnet_ternary_partition.json
 """
-import os
 import sys
 import json
 import argparse
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
 # 注册 cim::matmul custom op (torch.export.load 反序列化 .pt2 需要 op 已注册)
-_EXPORT_DIR = os.path.join(os.path.dirname(HERE), "export")
-if _EXPORT_DIR not in sys.path:
-    sys.path.insert(0, _EXPORT_DIR)
-import cim_op  # noqa: F401
+from cim_compiler.export import cim_op  # noqa: F401
 
 import torch
 import torch.export
 import torch.fx as fx
 
-from classify import mark_cim_nodes, node_backend, is_cim_matmul
+from cim_compiler.partition.classify import mark_cim_nodes, node_backend, is_cim_matmul
 
 
 @dataclass

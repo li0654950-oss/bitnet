@@ -13,20 +13,11 @@ CPU 降级 linalg 移到 lowering 阶段 (先 cim.matmul -> func.call 消除 unk
   python cim_compiler/ir/to_mlir.py
   python cim_compiler/ir/to_mlir.py --graph checkpoints/bitnet_ternary.pt2 --out checkpoints/bitnet_ternary.mlir
 """
-import os
 import sys
 import argparse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-# HERE = cim_compiler/ir/ ; 上两层 = repo root
-REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
 # 注册 cim::matmul custom op (torch.export.load 反序列化 + torch-mlir import 需要)
-_EXPORT_DIR = os.path.join(REPO, "cim_compiler", "export")
-if _EXPORT_DIR not in sys.path:
-    sys.path.insert(0, _EXPORT_DIR)
-import cim_op  # noqa: F401
+from cim_compiler.export import cim_op  # noqa: F401
 
 import torch
 import torch.export

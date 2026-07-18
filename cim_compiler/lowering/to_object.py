@@ -15,9 +15,10 @@ import argparse
 import importlib.util
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(os.path.dirname(HERE))
-if REPO not in sys.path:
-    sys.path.insert(0, REPO)
+
+# torch_mlir_e2e_test 不在 pip wheel (torch_mlir dist-info 无 e2e_test 子模块), 需从
+# torch-mlir 源码树导入 (refbackend L4 pipeline 用)。非 bitnet-cim 包范围, editable
+# 安装解决不了, 保留此路径 hack。
 _E2E_PATH = "/home/li/workspace/torch-mlir/projects/pt1/python"
 if _E2E_PATH not in sys.path:
     sys.path.insert(0, _E2E_PATH)

@@ -7,16 +7,7 @@
 用法:
   nanogpt-gpu python cim_compiler/cimres/passes/_s0_selftest.py
 """
-import os
 import sys
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(os.path.dirname(HERE))
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from cim_compiler.cimres.passes.common import parse_cimres
 from cim_compiler.cimres.verify import verify

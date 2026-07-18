@@ -15,17 +15,8 @@ verify(mod) -> issues: list[str], 空=通过。
 用法:
   python cim_compiler/cimres/verify.py --in <cimres.mlir>
 """
-import os
 import sys
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")   # cim_op 所在 (cim_compiler/__init__ 触发 export import)
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from cim_compiler.cimres.passes.common import walk_ops, func_blocks, matmuls_in_func
 

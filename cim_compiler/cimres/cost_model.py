@@ -19,17 +19,8 @@ T_MATMUL/T_WB + macro_busy + page_busy + SYNC_HALT join), 但不执行数值只�
 用法:
   python cim_compiler/cimres/cost_model.py --in <placed.mlir>
 """
-import os
 import sys
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from cim_compiler.cimres.hw_simulator import T_FETCH, T_DISPATCH, T_MATMUL, T_WB
 from cim_compiler.cimres.passes.common import func_blocks, matmuls_in_func

@@ -13,24 +13,17 @@
   python cim_compiler/partition/verify_partition.py
   python cim_compiler/partition/verify_partition.py --graph ... --partition ...
 """
-import os
 import sys
 import json
 import argparse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
 # 注册 cim::matmul custom op (torch.export.load 反序列化 .pt2 需要 op 已注册)
-_EXPORT_DIR = os.path.join(os.path.dirname(HERE), "export")
-if _EXPORT_DIR not in sys.path:
-    sys.path.insert(0, _EXPORT_DIR)
-import cim_op  # noqa: F401
+from cim_compiler.export import cim_op  # noqa: F401
 
 import torch
 import torch.export
 
-from classify import is_cim_matmul
+from cim_compiler.partition.classify import is_cim_matmul
 
 
 def main():

@@ -11,17 +11,8 @@ preload_weight / sync_halt 都是 0 operand 0 result 的元数据/副作用 op, 
 用法:
   python cim_compiler/cimres/passes/canonicalize.py --in <cimres.mlir> --out <out.mlir>
 """
-import os
 import sys
 import argparse
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(os.path.dirname(HERE))
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from cim_compiler.cimres.passes.common import walk_ops, func_blocks, matmuls_in_func
 

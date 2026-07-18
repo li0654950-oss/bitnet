@@ -26,20 +26,11 @@ MMIO (§2.3): shm (共享缓存, T_SHM) + reg (寄存器, T_REG) + cycle 统计�
 
 运行 (self-test): nanogpt-gpu python cim_compiler/cimres/hw_simulator.py
 """
-import os
 import sys
 import time
 import ctypes
 import threading
 import numpy as np
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-CIM_COMPILER = os.path.dirname(HERE)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 # CIM ASIC 硬件参数集中定义 (cim_compiler/cimres/hw_config.py, C/Python 镜像)
 from cim_compiler.cimres.hw_config import *   # noqa: F401  TILE/PAGE/三区/INSTR_CAPACITY/PRELOAD_BATCH/REG_BASE_DEFAULT/...

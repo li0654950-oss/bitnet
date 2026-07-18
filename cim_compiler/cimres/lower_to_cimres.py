@@ -21,14 +21,6 @@ import json
 import math
 import argparse
 
-HERE = os.path.dirname(os.path.abspath(__file__))        # cim_compiler/cimres/
-CIM_COMPILER = os.path.dirname(HERE)                     # cim_compiler/
-REPO = os.path.dirname(CIM_COMPILER)                     # repo root
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")        # cim_op.py 所在 (inference_model 顶层 import cim_op)
-for _p in (REPO, EXPORT_DIR):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 from torch_mlir import ir
 from torch_mlir.dialects import func as func_d
 from cim_compiler.cimres.dialect import (

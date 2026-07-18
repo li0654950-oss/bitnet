@@ -25,20 +25,12 @@ import sys
 import struct
 import argparse
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LOWERING = os.path.dirname(HERE)
-CIM_COMPILER = os.path.dirname(LOWERING)
-REPO = os.path.dirname(CIM_COMPILER)
-EXPORT_DIR = os.path.join(CIM_COMPILER, "export")
-BITNET = os.path.join(REPO, "bitnet")
-for _p in (REPO, EXPORT_DIR, BITNET):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch  # noqa: E402
 import torch.export  # noqa: E402
-import cim_op  # noqa: E402,F401  (注册 cim::matmul, 反序列化 .pt2 需要)
-from data_char import CharTokenizer  # noqa: E402
+from cim_compiler.export import cim_op  # noqa: E402,F401  (注册 cim::matmul, 反序列化 .pt2 需要)
+from bitnet.data_char import CharTokenizer  # noqa: E402
 from cim_compiler.lowering.buffer_kind import (  # noqa: E402
     classify_buffer, KIND_INVFREQ, KIND_CAUSAL_MASK, KIND_W_PACKED, KIND_LMHEAD, KIND_NAME)
 

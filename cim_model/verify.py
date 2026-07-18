@@ -3,7 +3,7 @@
 三级验证:
   1. Macro 级:    64×64 int8×ternary → int32 部分和 (精确整数)
   2. BitLinear 级: tile 切分 + int32 累加 + rescale (vs fp32 参考路径)
-  3. 模型级:      CIM 模型推理 vs bf16 STE 参考模型 (argmax 一致率)
+  3. 模型级:      CIM 模型推理 vs float32 STE 参考模型 (argmax 一致率)
 
 运行:
   /home/li/anaconda3/envs/nanogpt-gpu/bin/python cim_model/verify.py
@@ -137,7 +137,7 @@ def _val_idx(seq_len=256):
 
 
 def test_model_forward():
-    """CIM 模型 (fp32 三值通路) vs bf16 STE 参考模型: logits diff + argmax 一致率。"""
+    """CIM 模型 (fp32 三值通路) vs float32 STE 参考模型: logits diff + argmax 一致率。"""
     from model import BitNet
     from data_char import get_meta
     from cim_model.model_cim import patch_bitlinear, unpatch_bitlinear, load_ternary_into_model
@@ -146,19 +146,19 @@ def test_model_forward():
     vocab = get_meta()["vocab_size"]
     idx = _val_idx(256).to(device)
 
-    # ── 参考模型: bf16 原权重 + STE 伪量化 (patch 之前 forward) ──
-    ref_model = BitNet(vocab, **CFG).to(device, dtype=torch.bfloat16)
+    # ── 参考模型: float32 原权重 + STE 伪量化 (patch 之前 forward) ──
+    ref_model = BitNet(vocab, **CFG).to(device, dtype=torch.float32)
     sd = torch.load(CHECKPOINT_BEST, map_location=device, weights_only=True)
     ref_model.load_state_dict(sd)
     ref_model.eval()
     with torch.no_grad():
-        ref_logits, _ = ref_model(idx)  # bf16 STE 路径
+        ref_logits, _ = ref_model(idx)  # float32 STE 路径
     ref_logits = ref_logits.float()
 
     # ── CIM 模型: patch BitLinear.forward = CIM 定点, 加载三值权重 ──
     orig_fwd = patch_bitlinear()
     try:
-        cim_model = BitNet(vocab, **CFG).to(device, dtype=torch.bfloat16)
+        cim_model = BitNet(vocab, **CFG).to(device, dtype=torch.float32)
         n_ternary = load_ternary_into_model(cim_model, CHECKPOINT_TERNARY, device)
         cim_model.eval()
         with torch.no_grad():
@@ -195,7 +195,7 @@ def test_model_generate():
 
     orig_fwd = patch_bitlinear()
     try:
-        model = BitNet(vocab, **CFG).to(device, dtype=torch.bfloat16)
+        model = BitNet(vocab, **CFG).to(device, dtype=torch.float32)
         load_ternary_into_model(model, CHECKPOINT_TERNARY, device)
         model.eval()
         torch.manual_seed(0)
@@ -232,7 +232,7 @@ def main():
     test_bitlinear_vs_fp32_ref()
     test_bitlinear_padding()
 
-    print("\n[3] 模型级 (CIM 推理 vs bf16 STE 参考)")
+    print("\n[3] 模型级 (CIM 推理 vs float32 STE 参考)")
     test_model_forward()
     test_model_generate()
 
