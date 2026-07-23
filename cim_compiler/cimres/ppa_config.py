@@ -12,13 +12,13 @@
 """
 from dataclasses import dataclass
 
-from cim_compiler.cimres.hw_config import SHARED_SIZE, TILE   # 1MB 共享缓存 + Macro 64×64 (单一事实源)
+from cim_compiler.cimres.hw_config import (SHARED_SIZE, TILE,  # 1MB 共享缓存 + Macro TILE×TILE (单一事实源)
+    TILE_BYTES, I32_BYTES)  # 2bit packed tile + sizeof(int32) (消除本地重定义漂移)
 
-# Macro 一次 matmul = int8[TILE] × ternary[TILE,TILE] -> int32[TILE] = 4096 MAC
+# Macro 一次 matmul = int8[TILE] × ternary[TILE,TILE] -> int32[TILE] = TILE*TILE MAC (=4096 @TILE=64)
 MAC_PER_MATMUL = TILE * TILE
-A_PAGE_BYTES = TILE        # int8[TILE] 激活输入 (K 维 tile)
-PSUM_BYTES = TILE * 4      # int32[TILE] 累加输出 (N 维 tile)
-TILE_BYTES = TILE * TILE // 4   # 2bit packed TILE×TILE 权重 tile (PROG_WGT)
+A_PAGE_BYTES = TILE             # int8[TILE] 激活输入 (K 维 tile)
+PSUM_BYTES = TILE * I32_BYTES   # int32[TILE] 累加输出 (N 维 tile; I32_BYTES=4 非 CODES_PER_BYTE, 勿混)
 
 
 @dataclass

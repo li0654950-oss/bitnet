@@ -6,8 +6,9 @@
   macro_matmul   -> MACRO_MATMUL   (opcode=0x2, dest_id, PAGE_1=a_page, PAGE_2=psum_page, ACCUM)
   sync_halt      -> SYNC_HALT       (opcode=0x7)
 
-48-bit 字段: [47:45]opcode | [44:33]dest_id | [32:21]page1 | [20:9]page2 | [8]accum | [7:0]保留
-word = (opcode<<45)|(dest_id<<33)|(page1<<21)|(page2<<9)|(accum<<8), 每条 6 字节小端。
+48-bit 字段: [47:45]opcode | [44:33]dest_id[11:0] | [32:19]page1(14b) | [18:5]page2(14b) | [4]accum | [3:0]dest_id[15:12]
+word = (opcode<<45)|((dest_id&0xFFF)<<33)|((page1&PAGE_MASK)<<19)|((page2&PAGE_MASK)<<5)|(accum<<4)|((dest_id>>12)&0xF), 6 字节小端。
+  page 字段 14 bit (借保留位 [7:4], PAGE 派生后 PAGE 数可达 16384); Dest_ID 16b 非连续 [44:33]+[3:0]
 
 产物格式 (供 cim_stub.c 硬件驱动骨架加载, 小端):
   forward.bin (按 idx 索引, cim_launch_<idx> 用 idx 查段):
@@ -39,7 +40,11 @@ PRELOAD_MAGIC = b"CIMP"
 
 
 def encode(opcode, dest_id=0, page1=0, page2=0, accum=0):
-    word = (opcode << 45) | (dest_id << 33) | (page1 << 21) | (page2 << 9) | (accum << 8)
+    assert 0 <= dest_id < MACRO_MAX, f"dest_id={dest_id} >= MACRO_MAX={MACRO_MAX} (16b Dest_ID 上限)"
+    assert 0 <= page1 <= PAGE_MASK and 0 <= page2 <= PAGE_MASK, f"page1={page1}/page2={page2} 超 PAGE_MASK=0x{PAGE_MASK:x}"
+    # 48-bit: [47:45]op | [44:33]dest[11:0] | [32:19]page1(14b) | [18:5]page2(14b) | [4]accum | [3:0]dest[15:12]
+    word = ((opcode << 45) | ((dest_id & 0xFFF) << 33) | ((page1 & PAGE_MASK) << 19)
+            | ((page2 & PAGE_MASK) << 5) | (accum << 4) | ((dest_id >> 12) & 0xF))
     return word & ((1 << 48) - 1)
 
 
@@ -105,21 +110,21 @@ def emit(placed_path, weights_path, preload_out, forward_out):
                   f"> {SEG_MAX}, 启用大段分块 (P2-6, cim_launch 多块门铃)",
                   file=sys.stderr)
 
-    # ---- 读 weights, 建 dest_id -> tile_2bit (1024B) ----
+    # ---- 读 weights, 建 dest_id -> tile_2bit (TILE_BYTES) ----
     weights = read_weight_blob(weights_path)
     wmap = {_norm(w.name): w for w in weights}
-    tile_of = {}   # dest_id -> 1024B 2bit packed
+    tile_of = {}   # dest_id -> TILE_BYTES 2bit packed
     for d, (name, nb, kb) in dest_meta.items():
         we = wmap[name]
         N, K = we.N, we.K
         n_tiles = math.ceil(N / TILE)
         k_tiles = math.ceil(K / TILE)
         Np, Kp = n_tiles * TILE, k_tiles * TILE
-        packed = np.frombuffer(we.packed, dtype=np.uint8).reshape(N, K // 4)
-        packed_pad = np.zeros((Np, Kp // 4), dtype=np.uint8)
-        packed_pad[:N, :K // 4] = packed
-        tile = packed_pad[nb * TILE:(nb + 1) * TILE, kb * (TILE // 4):(kb + 1) * (TILE // 4)]
-        tile_of[d] = tile.tobytes()   # 64*16 = 1024B
+        packed = np.frombuffer(we.packed, dtype=np.uint8).reshape(N, K // CODES_PER_BYTE)
+        packed_pad = np.zeros((Np, Kp // CODES_PER_BYTE), dtype=np.uint8)
+        packed_pad[:N, :K // CODES_PER_BYTE] = packed
+        tile = packed_pad[nb * TILE:(nb + 1) * TILE, kb * (TILE // CODES_PER_BYTE):(kb + 1) * (TILE // CODES_PER_BYTE)]
+        tile_of[d] = tile.tobytes()   # TILE_BYTES = TILE*TILE//CODES_PER_BYTE
 
     # ---- forward.bin (按 idx 索引) ----
     n_idx = len(forward_segs)
@@ -144,9 +149,9 @@ def emit(placed_path, weights_path, preload_out, forward_out):
     for batch in batches:
         n_tile = len(batch)
         buf = struct.pack("<I", n_tile)
-        for d, b in batch:                  # tile 数据 (1024B/tile, 写覆盖区)
+        for d, b in batch:                  # tile 数据 (TILE_BYTES/tile, 写覆盖区)
             buf += tile_of[d]
-        for d, b in batch:                  # PROG_WGT 指令 (page1=b_page_start=i*4)
+        for d, b in batch:                  # PROG_WGT 指令 (page1=b_page_start, place.py 算 = i*PAGES_PER_TILE)
             buf += word_to_bytes(encode(OP_PROG_WGT, dest_id=d, page1=b))
         buf += word_to_bytes(encode(OP_SYNC_HALT))
         batch_bytes.append(buf)

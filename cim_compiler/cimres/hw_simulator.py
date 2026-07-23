@@ -38,9 +38,9 @@ from cim_compiler.cimres.ppa_config import PPAConfig, ActivityTracker, PPAEstima
 
 # ===== cycle 开销 (§3 无规定, 估算默认值, 真实硬件可调) =====
 T_FETCH    = 1    # 取指 (1 条 48-bit, §3.1)
-T_DISPATCH = 2    # 广播总线 Dest_ID 12b 路由 + 负载 (§2.2)
-T_PROG_WGT = 10   # 64×64 2bit (1024B) 解包 + load (§3.2)
-T_MATMUL   = 64   # 64×64 int8×ternary MvM -> int32 (§3.3, 64 输出每 cycle 一列)
+T_DISPATCH = 2    # 广播总线 Dest_ID 路由 + 负载 (§2.2; 位宽见 §3.1)
+T_PROG_WGT = 10   # 2bit tile 解包 + load (§3.2)
+# T_MATMUL 来自 hw_config (=TILE, ADC 串行列扫每 cycle 1 列; §3.3), from import * 带入
 T_WB       = 4    # 上行仲裁 + int32 ALU RMW (§2.1/2.2)
 T_SHM      = 2    # 共享缓存 MMIO (AXI, per 64B, §2.2)
 T_REG      = 1    # 寄存器 MMIO (§2.3)
@@ -76,16 +76,33 @@ class SharedCache:
         return self.data[addr:addr + n].astype(np.int8).astype(np.int32)
 
     def rmw_int32(self, page, y_int32, accum):
-        a32 = page * PAGE // 4
-        n = len(y_int32)
-        if not accum:
-            self.data32[a32:a32 + n] = y_int32
-        else:
-            self.data32[a32:a32 + n] = self.data32[a32:a32 + n] + y_int32
+        # 跨页 RMW: y_int32 可能跨多 PAGE (TILE>64, PSUM_PAGES_PER_NBLK>1; @TILE=64 单页)
+        per_page = PAGE // I32_BYTES
+        remaining = y_int32
+        cur_page = page
+        while len(remaining) > 0:
+            a32 = cur_page * PAGE // I32_BYTES
+            chunk = min(len(remaining), per_page)
+            if not accum:
+                self.data32[a32:a32 + chunk] = remaining[:chunk]
+            else:
+                self.data32[a32:a32 + chunk] = self.data32[a32:a32 + chunk] + remaining[:chunk]
+            remaining = remaining[chunk:]
+            cur_page += 1
 
     def read_int32_vec(self, page, n=TILE):
-        a32 = page * PAGE // 4
-        return self.data32[a32:a32 + n].copy()
+        # 跨页读 (TILE>64 跨多 PAGE; @TILE=64 单页)
+        per_page = PAGE // I32_BYTES
+        parts = []
+        cur_page = page
+        remaining = n
+        while remaining > 0:
+            a32 = cur_page * PAGE // I32_BYTES
+            chunk = min(remaining, per_page)
+            parts.append(self.data32[a32:a32 + chunk].copy())
+            remaining -= chunk
+            cur_page += 1
+        return np.concatenate(parts)[:n]
 
     def read_instr(self, byte_addr):
         b = self.data[byte_addr:byte_addr + 6]
@@ -106,13 +123,13 @@ class MacroArray:
     def __init__(self):
         self.macro = {}   # dest_id -> Macro
 
-    def load(self, dest_id, tile_2bit_1024B, cycle):
+    def load(self, dest_id, tile_2bit_packed, cycle):
         """PROG_WGT: 解包 2bit -> Macro[dest]. 返回完成 cycle (T_DISPATCH+T_PROG_WGT)。"""
         m = self.macro.get(dest_id)
         if m is None:
             m = Macro(); self.macro[dest_id] = m
         start = max(cycle, m.busy_until)                       # 同 Macro 串行
-        packed = np.frombuffer(tile_2bit_1024B, dtype=np.uint8).reshape(TILE, TILE // 4)
+        packed = np.frombuffer(tile_2bit_packed, dtype=np.uint8).reshape(TILE, TILE // CODES_PER_BYTE)
         m.weight = unpack_2bit_np(packed)                      # 数值同步
         m.busy_until = start + T_DISPATCH + T_PROG_WGT
         return m.busy_until
@@ -152,7 +169,7 @@ class BusDispatcher:
         self.tracker = tracker   # ActivityTracker (PPA 活动统计, 可选)
 
     def dispatch_prog_wgt(self, dest_id, b_page_start, cycle):
-        tile = self.cache.read_bytes(b_page_start * PAGE, 1024)
+        tile = self.cache.read_bytes(b_page_start * PAGE, TILE_BYTES)
         if self.tracker: self.tracker.record_prog_wgt()
         return self.macros.load(dest_id, tile, cycle)         # 含 T_DISPATCH+T_PROG_WGT
 
@@ -193,10 +210,10 @@ class Controller:
             while True:
                 w = self.cache.read_instr(addr); addr += 6; cycle += T_FETCH
                 op = (w >> 45) & 0x7
-                dest = (w >> 33) & 0xFFF
-                p1 = (w >> 21) & 0xFFF
-                p2 = (w >> 9) & 0xFFF
-                accum = (w >> 8) & 1
+                dest = ((w >> 33) & 0xFFF) | ((w & 0xF) << 12)   # Dest_ID 16b 非连续: [44:33]低12 + [3:0]高4
+                p1 = (w >> 19) & PAGE_MASK   # page1 14 bit [32:19] (PAGE 派生后 PAGE 数可达 16384)
+                p2 = (w >> 5) & PAGE_MASK    # page2 14 bit [18:5]
+                accum = (w >> 4) & 1
                 if op == OP_PROG_WGT:
                     self.dispatcher.dispatch_prog_wgt(dest, p1, cycle)            # 非阻塞 (更新 busy_until)
                 elif op == OP_MATMUL:

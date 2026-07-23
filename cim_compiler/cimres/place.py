@@ -24,7 +24,8 @@ import argparse
 
 from torch_mlir import ir
 from cim_compiler.cimres.dialect import register_cimres, i32_attr
-from cim_compiler.cimres.hw_config import A_PAGE_BASE, PSUM_PAGE_BASE, PRELOAD_BATCH  # ASIC 硬件参数 (集中定义)
+from cim_compiler.cimres.hw_config import (A_PAGE_BASE, PSUM_PAGE_BASE, PRELOAD_BATCH,  # ASIC 硬件参数 (集中定义)
+    PAGES_PER_TILE, PSUM_PAGES_PER_NBLK, MACRO_MAX)  # TILE 可变 PAGE 布局 + Macro 上限
 
 
 def place(cimres_in, out_path):
@@ -39,41 +40,53 @@ def place(cimres_in, out_path):
         for op in list(mod.body):
             if op.operation.name == "cimres.preload_weight":
                 dest_id = int(op.attributes["dest_id"].value)
-                b_page = (dest_id % PRELOAD_BATCH) * 4   # 批内偏移, 每 tile 4 PAGE
+                b_page = (dest_id % PRELOAD_BATCH) * PAGES_PER_TILE   # 批内偏移, 每 tile PAGES_PER_TILE PAGE (TILE=64->4)
                 op.attributes["b_page_start"] = i32_attr(b_page)
                 n_preload += 1
                 max_dest = max(max_dest, dest_id)
             elif op.operation.name == "func.func":
                 blk = op.regions[0].blocks[0]
-                for inner in list(blk.operations):
-                    if inner.operation.name != "cimres.macro_matmul":
-                        continue
+                inners = [o for o in list(blk.operations) if o.operation.name == "cimres.macro_matmul"]
+                # 预扫描 qkv 合并 func 的 k_tiles/n_tiles (TILE 可变, 不再硬编 8/16/12)
+                # q/k/v K 相同 -> k_tiles = max(k_blk)+1; n_tiles_q/k = max(n_blk of role)+1
+                k_tiles = 0; n_tiles_q = 0; n_tiles_k = 0; has_qkv = False
+                for inner in inners:
+                    role = str(inner.attributes["role"].value)
+                    kb = int(inner.attributes["k_blk"].value)
+                    nb = int(inner.attributes["n_blk"].value)
+                    if role in ("q", "k", "v"): has_qkv = True
+                    k_tiles = max(k_tiles, kb + 1)
+                    if role == "q": n_tiles_q = max(n_tiles_q, nb + 1)
+                    elif role == "k": n_tiles_k = max(n_tiles_k, nb + 1)
+                # S6: qkv 合并 func 内 q/k/v 各自 x_int8 不同 -> a_page/psum_page 错开 (3 组)
+                # a_off (A_PAGE 区, 每 k_blk 1 PAGE): q=0, k=k_tiles, v=2*k_tiles
+                # p_off (PSUM 区, 每 n_blk PSUM_PAGES_PER_NBLK PAGE): q=0, k=n_tiles_q, v=n_tiles_q+n_tiles_k
+                for inner in inners:
                     nb = int(inner.attributes["n_blk"].value)
                     kb = int(inner.attributes["k_blk"].value)
-                    # S6: qkv 合并 func 内 q/k/v 各自 x_int8 不同 -> a_page 错开 (3 组 A_PAGE);
-                    # PSUM_PAGE 错开 (q:0-7/k:8-11/v:12-15, 16 PAGE/层, bank0 32 PAGE 够)
                     role = str(inner.attributes["role"].value)
-                    if role == "k":
-                        a_off, p_off = 8, 8     # k: A_PAGE+8 (0x018+kb), PSUM+8 (0xC08+nb)
-                    elif role == "v":
-                        a_off, p_off = 16, 12    # v: A_PAGE+16 (0x020+kb), PSUM+12 (0xC0C+nb)
-                    else:   # "q" 或 "none"
-                        a_off, p_off = 0, 0      # q + 非 qkv: 原 A_PAGE+kb, PSUM+nb
+                    if has_qkv and role == "k":
+                        a_off, p_off = k_tiles, n_tiles_q
+                    elif has_qkv and role == "v":
+                        a_off, p_off = 2 * k_tiles, n_tiles_q + n_tiles_k
+                    else:   # q 或普通 func (role=none)
+                        a_off, p_off = 0, 0
                     inner.attributes["a_page"] = i32_attr(A_PAGE_BASE + a_off + kb)
-                    inner.attributes["psum_page"] = i32_attr(PSUM_PAGE_BASE + p_off + nb)
+                    # psum_page: 每 n_blk 占 PSUM_PAGES_PER_NBLK PAGE (TILE>64 跨页; @TILE=64=1 不变)
+                    inner.attributes["psum_page"] = i32_attr(PSUM_PAGE_BASE + (p_off + nb) * PSUM_PAGES_PER_NBLK)
                     n_matmul += 1
-        if max_dest >= 4096:
+        if max_dest >= MACRO_MAX:
             raise ValueError(
-                f"[C2] max dest_id={max_dest} >= Macro 上限 4096 (§4.5)。"
+                f"[C2] max dest_id={max_dest} >= Macro 上限 {MACRO_MAX} (§4.5)。"
                 f"tile 总数 {max_dest + 1} 超 Macro 数, 降低模型规模或启用 Macro 复用")
         mod.operation.verify()
         with open(out_path, "w") as f:
             f.write(str(mod))
         print(f"[C2] {n_preload} preload + {n_matmul} matmul 物理绑定, "
-              f"max dest_id={max_dest} (< 4096: OK)",
+              f"max dest_id={max_dest} (< {MACRO_MAX}: OK)",
               file=sys.stderr)
         print(f"[C2] A_PAGE=0x{A_PAGE_BASE:x}+k_blk, PSUM_PAGE=0x{PSUM_PAGE_BASE:x}+n_blk, "
-              f"b_page=(dest%{PRELOAD_BATCH})*4", file=sys.stderr)
+              f"b_page=(dest%{PRELOAD_BATCH})*{PAGES_PER_TILE}", file=sys.stderr)
         print(f"[C2] saved: {out_path}", file=sys.stderr)
     return mod
 

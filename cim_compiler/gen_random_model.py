@@ -15,6 +15,7 @@ import argparse
 import torch
 from bitnet.model import BitNet
 from bitnet.export_ternary import weight_quant, pack_2bit, is_bitlinear_weight
+from cim_compiler.cimres.hw_config import TILE, MACRO_MAX
 
 
 def gen(vocab_size, d_model, block_size, n_layer, n_head, n_kv_head, ffn_dim, out, seed=42):
@@ -34,14 +35,14 @@ def gen(vocab_size, d_model, block_size, n_layer, n_head, n_kv_head, ffn_dim, ou
             exported[name] = {"packed": packed.cpu(), "scale": float(scale), "shape": tuple(w.shape)}
             n_bl += 1
             N, K = w.shape
-            n_tile += math.ceil(N / 64) * math.ceil(K / 64)
+            n_tile += math.ceil(N / TILE) * math.ceil(K / TILE)
         else:
             exported[name] = t.cpu()
     torch.save(exported, out)
     print(f"[gen] BitNet(vocab={vocab_size} d={d_model} L={n_layer} h={n_head} "
           f"kv={n_kv_head} ffn={ffn_dim} bs={block_size})")
     print(f"[gen] {n_bl} BitLinear, {n_tile} tile "
-          f"({'< 4096 Macro OK' if n_tile < 4096 else '>= 4096 超 Macro, 容量校验会报错'})")
+          f"({'OK' if n_tile < MACRO_MAX else '超 Macro 容量校验会报错'}, < {MACRO_MAX})")
     print(f"[gen] saved: {out}")
     return n_tile
 

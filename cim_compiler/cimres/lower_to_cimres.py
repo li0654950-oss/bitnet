@@ -27,7 +27,7 @@ from cim_compiler.cimres.dialect import (
     register_cimres, make_macro_matmul, make_preload_weight,
     make_sync_halt, make_tile_group, int32_vec,
 )
-from cim_compiler.cimres.hw_config import TILE  # Macro 物理维度 64×64 (单一事实源)
+from cim_compiler.cimres.hw_config import TILE, MACRO_MAX  # Macro 物理维度 + 总数上限 (单一事实源)
 from cim_compiler.export.weight_blob import read_weight_blob
 
 
@@ -133,7 +133,7 @@ def lower_to_cimres(partition_path, weights_path, out_path):
         with open(out_path, "w") as f:
             f.write(str(mod))
         print(f"[C1] {len(part['cim_blocks'])} BitLinear -> cimres IR, "
-              f"{total_tiles} tile (< 4096 Macro: {'OK' if total_tiles < 4096 else 'OVER'})",
+              f"{total_tiles} tile (< {MACRO_MAX} Macro: {'OK' if total_tiles < MACRO_MAX else 'OVER'})",
               file=sys.stderr)
         print(f"[C1] saved: {out_path}", file=sys.stderr)
     return mod, total_tiles

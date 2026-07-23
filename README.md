@@ -170,7 +170,7 @@ python cim_compiler/pipeline.py --kv                         # KV 流程 (export
 python cim_compiler/pipeline.py --start-step 12              # 只跑 AOT 构建 (调试)
 python cim_compiler/pipeline.py --no-sim                     # 跳过 JIT 仿真
 
-# === 多规模回归 (任意规模 ≤4096 Macro, 随机权重验证编译兼容) ===
+# === 多规模回归 (任意规模 ≤65536 Macro, 随机权重验证编译兼容) ===
 python cim_compiler/gen_random_model.py --n_layer 2 --d_model 256 --ffn_dim 1024 --out /tmp/small.pt
 python cim_compiler/pipeline.py --ternary /tmp/small.pt --n_layer 2 --d_model 256 --ffn_dim 1024
 
@@ -275,7 +275,7 @@ cim_compiler/
 | 3 | partition | `partition.json`（25 CIM 块，qkv 合并）|
 | 4 | C1 lower_to_cimres | cimres IR（tile 展开 + role 元数据）|
 | 5 | cimres passes | canon + cse（逻辑层冗余消除）|
-| 6 | C2 place | placed IR（容量校验 ≤4096 Macro，PAGE 布局）|
+| 6 | C2 place | placed IR（容量校验 ≤65536 Macro，PAGE 布局）|
 | 7 | verify | 结构校验（dest_id/accum/PAGE/a_page）|
 | 8 | 调度分析 | cost_model/scheduler/page_alloc（makespan/最优性/PAGE 报告）|
 | 9 | C3 emit_instr | `forward.bin` + `preload.bin`（`--kv` 用 `_kv` 后缀）|
@@ -312,7 +312,7 @@ cim_compiler/
 
 - **cim.matmul custom op**：BitLinearInference 用 `torch.ops.cim.matmul`（int8 激活 × 2bit 打包权重 -> int32），torch.export 保留为 op 节点不内联，CPU/CIM 在 IR 天然分离。
 - **固定硬件驱动**：`cim_stub.c` 单一 `cim_launch(idx, X, W)`，idx 运行时参数查 `forward.bin` 段，`.so` 一次编译任意规模复用（规模变只改 forward.bin + IR）。
-- **tile 切分**：权重 `W[N,K]` 切 64×64 tile，一 tile 一 Macro（≤4096），N 维分块输出 / K 维累加 reduce（accum 字段）。
+- **tile 切分**：权重 `W[N,K]` 切 TILE×TILE tile（TILE 可变，`hw_config.py` 单一旋钮，16/32/64/128/256 二次幂），一 tile 一 Macro（≤65536），N 维分块输出 / K 维累加 reduce（accum 字段）。
 - **两阶段共享缓存**：Preload 一次性权重驻留 Macro（`preload.bin`/CIMP），Forward 流式激活（`forward.bin`/CIMF）。
 - **数值/时序解耦**：dispatch 同步算 matmul+RMW（max_diff=0），`busy_until`/`page_busy` 统计 Macro 并行时序。
 - **w_packed 传而不用**：`cim_launch` 不读 W 数据（Preload 已驻留 Macro），W memref 仅 shape 对即可，AOT 模式用空壳。
@@ -320,7 +320,7 @@ cim_compiler/
 - **cim_main 固定宿主**：AOT `cim_main.c` 通用宿主，超参运行时从 `model_config.bin` 读（`gen_config.py` 从 .pt2 提取），forward 参数个数随 n_layer 变由 **libffi** 运行时变参调用解决，换模型不改 C 代码。
 - **PPA 架构级估算**：`ppa_config.py` 在仿真器上加活动因子统计，28nm@1GHz 估算计算耗时/功耗能效/面积（±30~50%），cim_sim 跑完 server 自动打印报告（见 `sys_sim.md` §7）。
 - **KV cache（CPU 侧，CIM 零改动）**：`inference_model.py` `RotaryMHAInference.step_stateless(h, k_in, v_in, cos, sin)` 无状态增量 forward（cache 显式 IO，cos/sin 外部传入避免动态 arange），`_KVCacheModel` 包装导出 dynamic T cache。CIM/lowering/cim_stub 零改动，O(n²)->O(n) 由 `cim_launch` 运行时 M 维 T->1（`cim_stub.c` 对 M 行循环，makespan ∝ M 行数，非 M-tile ceil(T/64)）。AOT 多输出 consume `mrf32_mrf32_mrf32`（3 个 `{i64,ptr}*` 参数，对齐 refbackend `get_ctype_func`）。实测 n=80 speedup 42x（`cost_model --kv` 量化 speedup ≈ (n+1)/2）。
-- **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（q:0-63/k:64-95/v:96-127），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` 用 partition.json 元数据识别 qkv（方案 B: role q/k/v + 同 blk_idx, IR walk 顺序 == cim_blocks 展开顺序; 替代旧 shape 启发式 [Nq>Nk=Nv]）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
+- **跨 BitLinear q/k/v 合并（S6）**：同层 q/k/v 三个 BitLinear 读同一 x_int8，dest_id 不重叠（@TILE=64: q:0-63/k:64-95/v:96-127，随 TILE 派生），合并为 1 doorbell（128 MATMUL + SYNC_HALT），CIM 内不同 Macro 天然并行（§4.7.7），makespan 338->198/层，CIM cycle 6268->5428（-13.4%，spec-faithful 真提升）。IR 级合并：`cim_stub_lower.py` 用 partition.json 元数据识别 qkv（方案 B: role q/k/v + 同 blk_idx, IR walk 顺序 == cim_blocks 展开顺序; 替代旧 shape 启发式 [Nq>Nk=Nv]）+ IR 变换 pass（`_collect_movable` BFS 收集 q/k si32 的 transitive use，按 IR 顺序移到 qkv call result 后恢复 dominance）+ `cim_launch_qkv(idx,Xq,Wq,Xk,Wk,Xv,Wv)->(Q,K,V)` 多输出（Memref2D3 struct by value，LLVM sret）。forward.bin 段数 37->25，cim_sim 跑通数值不变。
 
 ### 编译器架构分析
 
@@ -342,17 +342,18 @@ Macro 不存激活/PSUM，只存权重；激活和 PSUM 在 1MB SharedCache（SR
 
 | 空间 | 存什么 | 生命周期 |
 |---|---|---|
-| Macro RRAM（4096×64×64 2bit cell）| 权重 1 tile = 1024B | **静态全驻留**（RRAM 非易失，推理期不重载）|
-| SharedCache A_PAGE（`0x010+`）| 激活 int8（64B/tile）| 动态，每 token 重写 |
-| SharedCache PSUM（`0xC00+`）| 输出 int32（256B/tile）| RMW 累加，K 维多 tile 共享 |
+| Macro RRAM（65536×TILE×TILE 2bit cell）| 权重 1 tile = TILE_BYTES | **静态全驻留**（RRAM 非易失，推理期不重载）|
+| SharedCache A_PAGE（`A_PAGE_BYTE=0x1000` 起，page 索引派生）| 激活 int8（TILE B/tile）| 动态，每 token 重写 |
+| SharedCache PSUM（`PSUM_BYTE=0xC0000` 起，page 索引派生）| 输出 int32（4×TILE B/tile = 1 PAGE）| RMW 累加，K 维多 tile 共享 |
 
-- **权重**：3664 tile 一次性 Preload 到 3664 个 Macro（< 4096），跨层共享不重载，利用率 **89%**。dest_id 线性编号（mesh 清理后 `T_ROUT_PER_HOP=0`，无物理 2D 网格路由，所有 Macro 等价）。
+- **权重**：3664 tile 一次性 Preload 到 3664 个 Macro（< 65536），跨层共享不重载，利用率 **89%**。dest_id 线性编号（mesh 清理后 `T_ROUT_PER_HOP=0`，无物理 2D 网格路由，所有 Macro 等价）。
 - **激活**：K 维切 `k_tiles` 段存 a_page，同 k_blk 的多个 N-tile **广播共享**读入（1 份激活喂多个 Macro）。
 - **PSUM**：同 n_blk 跨 K 维 RMW 累加（`accum` 字段，首拍覆盖、后续累加）。
 
 一次 q_proj（512×512，M=1 单 token）运算的分布：
 
 ```
+(@TILE=64 示例; TILE 可变, a_page/psum_page 随 PAGE=4*TILE 派生)
 权重: Macro[0..63] 各持 64×64 tile (Preload 驻留, 不动)
 kb=0: a_page=0x010 ─广播─> Macro[ 0.. 7] 并行 8 N-tile -> psum 0xC00..0xC07 (accum=0 覆盖)
 kb=1: a_page=0x011 ─广播─> Macro[ 8..15] 并行 8 N-tile -> psum 0xC00..0xC07 (accum=1 累加)
@@ -364,25 +365,25 @@ kb=7: a_page=0x017 ─广播─> Macro[56..63] 并行 8 N-tile -> psum = 完整 
 
 | 常量 | cycle | 含义 |
 |---|---|---|
-| T_DISPATCH | 2 | 广播总线路由 Dest_ID |
+| T_DISPATCH | 2 | 广播总线路由 Dest_ID（16b）|
 | T_PROG_WGT | 10 | Preload：2bit tile 解包装载 |
-| T_MATMUL | 64 | 运算：ADC 逐列量化 64 列（KCL 并行 1 cycle，**ADC 串行是瓶颈**，非 KCL）|
+| T_MATMUL | TILE | 运算：ADC 逐列量化 TILE 列（KCL 并行 1 cycle，**ADC 串行是瓶颈**，非 KCL；随 TILE 派生）|
 | T_WB | 4 | 写回：int32 RMW 累加 |
 
-- 稳态一次 tile = T_DISPATCH + T_MATMUL + T_WB = **70 cycle**（70 ns）
+- 稳态一次 tile = T_DISPATCH + T_MATMUL + T_WB = **TILE+6 cycle**（@TILE=64 = 70 ns）
 - 调度：**k 外 n 内**（K 维串行避免 PSUM 写冲突，N 维并行共享 a_page 广播）
-- 单 Macro 峰值 64 MAC/cycle = 0.128 TOPS @1GHz；4096 Macro 满载 ~524 TOPS（理论，受 dispatch/总线/利用率限制）
+- 单 Macro 峰值 TILE MAC/cycle；65536 Macro 满载（理论，受 dispatch/总线/利用率限制）
 
 #### PPA 估算口径（`ppa_config.py`，28nm@1GHz，±30~50%）
 
 - **TOPS = 2 × GMACs**：1 MAC = 2 OP 标称口径（工业标称，非 CIM 物理实际操作数）。CIM 三值权重省乘法器，能效高主要来自**能耗分母小**（e_mac=0.5pJ），非分子。
 - **两口径**：稳态 `tops_w`（不含 Preload 一次性 RRAM 编程）/ amortized `tops_w_amort`（含 Preload 分摊到本次）。
-- **估算偏保守**：`n_mac` / `n_prog_cell` 按全 tile 4096 计，未扣 0 权重 -> 能耗高估、能效低估（见下）。
+- **估算偏保守**：`n_mac` / `n_prog_cell` 按全 tile TILE² 计，未扣 0 权重 -> 能耗高估、能效低估（见下）。
 
 #### 稀疏性：32% 训练 0 + 0.21% 补零
 
 - **训练稀疏 0**：4,791,436（32.0%），模型学出，各层均匀（30~33%），+1/-1 近乎对称（34.08% / 33.92%）
-- **结构补零**：32,256（0.21%），tile 对齐 ceil 补的，集中在 `lm_head` 尾部 8 个 Macro（vocab=65 非 64 整除，每 Macro 98.4% 是补零）
+- **结构补零**：32,256（0.21%），tile 对齐 ceil 补的，集中在 `lm_head` 尾部（vocab=65 非 TILE 整除，@TILE=64 尾部 8 个 Macro，每 Macro 98.4% 是补零）
 
 CIM 对 0 权重的稀疏红利分三层（核心：0 cell 电导 G=0 -> 电流 I=0，欧姆定律物理天然不贡献，非「检测后跳过」）：
 
@@ -390,9 +391,21 @@ CIM 对 0 权重的稀疏红利分三层（核心：0 cell 电导 G=0 -> 电流 
 |---|---|---|
 | MAC 动态能耗 | ✅ 天然省 | RRAM G=0 -> I=0，0 cell 物理不产生电流（已发生）|
 | Preload 编程能耗 | ✅ 可省（需 ISA 改）| 0 cell 可不编程（默认高阻=0），省 ~32% 写入 |
-| 计算时序 T_MATMUL | ❌ 省不了 | ADC 逐列量化，列内 0 不影响；整列全 0 概率 = 0.32⁶⁴ ≈ 0 |
+| 计算时序 T_MATMUL | ❌ 省不了 | ADC 逐列量化，列内 0 不影响；整列全 0 概率 = 0.32^TILE ≈ 0 |
 
 > 当前 PPA 按全 tile 计未反映 32% 物理红利 -> 估算保守。L1（零硬件改 `ppa_config` 统计非零）可让估算诚实化；L2（ISA 加 partial PROG_WGT + 位图）省真实 Preload 能耗。三值 2bit 稠密已紧凑，存储稀疏化不划算（元数据开销抵消收益）。
+
+#### TILE 可变 + PAGE 派生（macro 尺寸参数化）
+
+`hw_config.py` 的 `TILE` 是单一旋钮（改一处全链派生），支持 16/32/64/128/256（二次幂）。已验证 @TILE=32/64/128 三档 `max_diff=0`（@TILE=32 n_macro=14640 触发 Dest_ID 16b 路由；@TILE=128 PAGE=512 PSUM 1 PAGE 不跨页）。
+
+- **PAGE = TILE × I32_BYTES**（4×TILE，随 TILE 变）：PSUM 恰好 1 PAGE/n_blk，**无 waste，恒不跨页**（PSUM_PAGES_PER_NBLK=1），消除跨页 RMW，计算简便高效。
+- **page 字段 14 bit**（48-bit 指令 `[47:45]op | [44:33]dest[11:0] | [32:19]page1(14b) | [18:5]page2(14b) | [4]accum | [3:0]dest[15:12]`，借保留位 [7:4]）：支持 TILE=16 PAGE=64 -> 16384 PAGE。
+- **Dest_ID 16 bit**（MACRO_MAX=65536，借保留位 [3:0] 给 dest 高 4b）：支持小 TILE 多 Macro（@TILE=32 需 14640 > 4096）。
+- **三区 byte 边界固定 + page 索引派生**（`byte//PAGE`）：OVERWRITE/A_PAGE/INSTR/PSUM byte 边界固定，page 索引随 PAGE 变（@PAGE=256 同原 0x010/0xBF0/0xC00）。
+- **assert TILE 二次幂**：PAGE=4×TILE 硬件 page×PAGE 移位译码需二次幂。
+
+@TILE=64 zero-change（PAGE=256，三区/容量全同原值）。改 `hw_config.py` `TILE=N`（N 二次幂 16-256）即探索任意尺寸，PAGE 自动派生，PSUM 恒 1 PAGE/n_blk 不跨页。
 
 #### 架构扩展边界（变化支持矩阵）
 

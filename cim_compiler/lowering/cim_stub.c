@@ -121,10 +121,10 @@ void cim_load_forward(const char *path) {
             uint64_t word = 0;
             for (int b = 0; b < 6; b++) word |= (uint64_t)p[b] << (b * 8);
             if (((word >> 45) & 0x7) == OP_MATMUL) {
-                uint64_t page1 = ((word >> 21) & 0xFFF) + A_BANK_OFF;
-                uint64_t page2 = ((word >> 9) & 0xFFF) + P_BANK_OFF;
-                word = (word & ~((uint64_t)0xFFF << 21 | (uint64_t)0xFFF << 9))
-                       | (page1 << 21) | (page2 << 9);
+                uint64_t page1 = ((word >> 19) & PAGE_MASK) + A_BANK_OFF;
+                uint64_t page2 = ((word >> 5) & PAGE_MASK) + P_BANK_OFF;
+                word = (word & ~((uint64_t)PAGE_MASK << 19 | (uint64_t)PAGE_MASK << 5))
+                       | (page1 << 19) | (page2 << 5);
                 for (int b = 0; b < 6; b++) p[b] = (uint8_t)((word >> (b * 8)) & 0xFF);
             }
         }
@@ -148,10 +148,10 @@ void cim_preload_init(const char *path) {
     for (uint32_t b = 0; b < n_batch; b++) {
         uint8_t *p = buf + body + b_off[b];
         uint32_t n_tile = *(uint32_t *)p; p += 4;
-        /* 写 tile 到覆盖区 (OVERWRITE_BASE + i*4)*PAGE, 每 tile 1024B = 4 PAGE */
+        /* 写 tile 到覆盖区 (OVERWRITE_BASE + i*PAGES_PER_TILE)*PAGE, 每 tile TILE_BYTES = PAGES_PER_TILE PAGE */
         for (uint32_t i = 0; i < n_tile; i++)
-            shm_write((long)(OVERWRITE_BASE + i * 4) * PAGE, p + i * 1024, 1024);
-        p += (long)n_tile * 1024;
+            shm_write((long)(OVERWRITE_BASE + i * PAGES_PER_TILE) * PAGE, p + i * TILE_BYTES, TILE_BYTES);
+        p += (long)n_tile * TILE_BYTES;
         /* 写 PROG_WGT 指令区 + SYNC_HALT */
         uint32_t instr_size = n_tile * 6 + 6;
         shm_write((long)INSTR_BASE * PAGE, p, instr_size);
@@ -192,6 +192,25 @@ static Memref2D cim_launch_impl(const int8_t *x, const uint8_t *w,
     free(w_int);
     Memref2D r = {result, result, 0, M, N, N, 1};
     return r;
+}
+
+/* 读 PSUM 跨页 (TILE>64 跨 PSUM_PAGES_PER_NBLK PAGE; @TILE=64 单页).
+ * p_base: PSUM bank 基址 (含 bn*P_BANK_OFF); p_off: role 偏移 (q=0/k=n_tiles_q/v=n_tiles_q+n_tiles_k, PAGE 数).
+ * 每 nb 占 PSUM_PAGES_PER_NBLK PAGE, 读 TILE 个 int32 -> dst[nb*TILE..]. */
+static void read_psum_batch(long p_base, int64_t p_off, int32_t *dst, int64_t n_tiles, int64_t N) {
+    for (int64_t nb = 0; nb < n_tiles; nb++) {
+        long cur_page = p_base + (p_off + nb) * PSUM_PAGES_PER_NBLK;
+        int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
+        int64_t need = e - s;   /* 实际 int32 数 (末 tile 可能 < TILE) */
+        int32_t acc_buf[PAGE / I32_BYTES];   /* 64 int32, 固定不依赖 TILE (解耦 acc_buf 与 TILE) */
+        int64_t got = 0;
+        while (got < need) {
+            int64_t chunk = (need - got < PAGE / I32_BYTES) ? (need - got) : PAGE / I32_BYTES;
+            shm_read(cur_page * PAGE, acc_buf, chunk * I32_BYTES);
+            memcpy(dst + s + got, acc_buf, (size_t)chunk * sizeof(int32_t));
+            got += chunk; cur_page++;
+        }
+    }
 }
 
 /* ===== [A1] 单一 @cim_launch(idx, X, W): MMIO 驱动 Forward, idx 参数查 forward.bin 段 =====
@@ -247,12 +266,7 @@ Memref2D cim_launch(int64_t idx,
                 reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
             }
             /* 读 PSUM(m, bn) [CIM 算 m+1 并行, bn != bn_next 不冲突] */
-            for (int64_t nb = 0; nb < n_tiles; nb++) {
-                int32_t acc_buf[TILE];
-                shm_read((p_base + nb) * PAGE, acc_buf, PAGE);
-                int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
-                memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
-            }
+            read_psum_batch(p_base, 0, result + m * N, n_tiles, N);
         }
     } else {
         /* 大段分块 (n_blk > 1): 串行, 流水待扩展 */
@@ -270,12 +284,7 @@ Memref2D cim_launch(int64_t idx,
                 reg_write((long)INT_CLEAR_REG, 1);
                 mm_done += blk_mm;
             }
-            for (int64_t nb = 0; nb < n_tiles; nb++) {
-                int32_t acc_buf[TILE];
-                shm_read((long)(PSUM_PAGE_BASE + nb) * PAGE, acc_buf, PAGE);
-                int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
-                memcpy(result + m * N + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
-            }
+            read_psum_batch(PSUM_PAGE_BASE, 0, result + m * N, n_tiles, N);
         }
     }
     Memref2D r = {result, result, 0, M, N, N, 1}; return r;
@@ -287,14 +296,7 @@ Memref2D cim_launch(int64_t idx,
  * 多输出: struct{Memref2D Q,K,V} by value (LLVM sret, MLIR func.call 多结果 -> llvm.struct)。 */
 typedef struct { Memref2D q, k, v; } Memref2D3;
 
-static void read_psum_batch(long p_base, int32_t *dst, int64_t n_tiles, int64_t N) {
-    for (int64_t nb = 0; nb < n_tiles; nb++) {
-        int32_t acc_buf[TILE];
-        shm_read((p_base + nb) * PAGE, acc_buf, PAGE);
-        int64_t s = nb * TILE, e = s + TILE; if (e > N) e = N;
-        memcpy(dst + s, acc_buf, (size_t)(e - s) * sizeof(int32_t));
-    }
-}
+static void read_psum_batch(long p_base, int64_t p_off, int32_t *dst, int64_t n_tiles, int64_t N);
 
 Memref2D3 cim_launch_qkv(int64_t idx,
     void *xqa, void *xqaa, int64_t xqoff, int64_t M, int64_t K, int64_t xqs0, int64_t xqs1,
@@ -333,8 +335,8 @@ Memref2D3 cim_launch_qkv(int64_t idx,
         /* S2 流水 prologue: 写 3 组 A_PAGE(0, bank0) [a_off=0/8/16] + doorbell */
         for (int64_t kb = 0; kb < k_tiles; kb++) {
             shm_write((long)(A_PAGE_BASE + 0 + kb) * PAGE, xq + 0*K + kb*TILE, TILE);
-            shm_write((long)(A_PAGE_BASE + 8 + kb) * PAGE, xk + 0*K + kb*TILE, TILE);
-            shm_write((long)(A_PAGE_BASE + 16 + kb) * PAGE, xv + 0*K + kb*TILE, TILE);
+            shm_write((long)(A_PAGE_BASE + k_tiles + kb) * PAGE, xk + 0*K + kb*TILE, TILE);
+            shm_write((long)(A_PAGE_BASE + 2*k_tiles + kb) * PAGE, xv + 0*K + kb*TILE, TILE);
         }
         shm_write((long)INSTR_BASE * PAGE, g_fwd_base + g_fwd_off[idx], n_mm * 6);
         shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
@@ -346,8 +348,8 @@ Memref2D3 cim_launch_qkv(int64_t idx,
             const uint8_t *seg_next = bn_next ? g_fwd_base2 : g_fwd_base;
             if (m + 1 < M) for (int64_t kb = 0; kb < k_tiles; kb++) {
                 shm_write((a_base + 0 + kb) * PAGE, xq + (m+1)*K + kb*TILE, TILE);
-                shm_write((a_base + 8 + kb) * PAGE, xk + (m+1)*K + kb*TILE, TILE);
-                shm_write((a_base + 16 + kb) * PAGE, xv + (m+1)*K + kb*TILE, TILE);
+                shm_write((a_base + k_tiles + kb) * PAGE, xk + (m+1)*K + kb*TILE, TILE);
+                shm_write((a_base + 2*k_tiles + kb) * PAGE, xv + (m+1)*K + kb*TILE, TILE);
             }
             while (reg_read((long)IRQ_STATUS_REG) != IRQ_DONE) ;
             reg_write((long)INT_CLEAR_REG, 1);
@@ -356,18 +358,18 @@ Memref2D3 cim_launch_qkv(int64_t idx,
                 shm_write((long)INSTR_BASE * PAGE + n_mm * 6, (const void *)HALT, 6);
                 reg_write((long)DOORBELL_REG, (long)INSTR_BASE * PAGE);
             }
-            /* 读 3 组 PSUM(m, bn): Q(p_off=0, nq), K(p_off=8, nk), V(p_off=12, nv) */
-            read_psum_batch(p_base + 0, Q + m*Nq, nq, Nq);
-            read_psum_batch(p_base + 8, K_ + m*Nk, nk, Nk);
-            read_psum_batch(p_base + 12, V + m*Nv, nv, Nv);
+            /* 读 3 组 PSUM(m, bn): Q(p_off=0, nq), K(p_off=nq, nk), V(p_off=nq+nk, nv) */
+            read_psum_batch(p_base, 0, Q + m*Nq, nq, Nq);
+            read_psum_batch(p_base, nq, K_ + m*Nk, nk, Nk);
+            read_psum_batch(p_base, nq + nk, V + m*Nv, nv, Nv);
         }
     } else {
         /* 大段分块 (qkv 128 < 681, 一般不分块; 保留串行 fallback) */
         for (int64_t m = 0; m < M; m++) {
             for (int64_t kb = 0; kb < k_tiles; kb++) {
                 shm_write((long)(A_PAGE_BASE + 0 + kb) * PAGE, xq + m*K + kb*TILE, TILE);
-                shm_write((long)(A_PAGE_BASE + 8 + kb) * PAGE, xk + m*K + kb*TILE, TILE);
-                shm_write((long)(A_PAGE_BASE + 16 + kb) * PAGE, xv + m*K + kb*TILE, TILE);
+                shm_write((long)(A_PAGE_BASE + k_tiles + kb) * PAGE, xk + m*K + kb*TILE, TILE);
+                shm_write((long)(A_PAGE_BASE + 2*k_tiles + kb) * PAGE, xv + m*K + kb*TILE, TILE);
             }
             int64_t mm_done = 0;
             for (int64_t b = 0; b < n_blk; b++) {
@@ -379,9 +381,9 @@ Memref2D3 cim_launch_qkv(int64_t idx,
                 reg_write((long)INT_CLEAR_REG, 1);
                 mm_done += blk_mm;
             }
-            read_psum_batch(PSUM_PAGE_BASE + 0, Q + m*Nq, nq, Nq);
-            read_psum_batch(PSUM_PAGE_BASE + 8, K_ + m*Nk, nk, Nk);
-            read_psum_batch(PSUM_PAGE_BASE + 12, V + m*Nv, nv, Nv);
+            read_psum_batch(PSUM_PAGE_BASE, 0, Q + m*Nq, nq, Nq);
+            read_psum_batch(PSUM_PAGE_BASE, nq, K_ + m*Nk, nk, Nk);
+            read_psum_batch(PSUM_PAGE_BASE, nq + nk, V + m*Nv, nv, Nv);
         }
     }
     Memref2D3 r = {{Q,Q,0,M,Nq,Nq,1}, {K_,K_,0,M,Nk,Nk,1}, {V,V,0,M,Nv,Nv,1}}; return r;
